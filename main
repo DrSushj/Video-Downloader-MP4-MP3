@@ -1,0 +1,3718 @@
+import os
+import sys
+import re
+import time
+import queue
+import shutil
+import threading
+import webbrowser
+import subprocess
+import struct
+import json
+import base64
+import hashlib
+import platform
+from datetime import datetime, timedelta, timezone
+import tempfile
+import zipfile
+from pathlib import Path
+from urllib.parse import urlparse, unquote
+from urllib.parse import urljoin
+from urllib.parse import parse_qs
+from tkinter import filedialog
+
+try:
+    import customtkinter as ctk
+except ImportError:
+    print("Fehlt: customtkinter")
+    print("Installiere es mit:")
+    print("python -m pip install customtkinter")
+    input("Enter drücken...")
+    raise
+
+try:
+    import requests
+except ImportError:
+    print("Fehlt: requests")
+    print("Installiere es mit:")
+    print("python -m pip install requests")
+    input("Enter drücken...")
+    raise
+
+try:
+    from Crypto.Cipher import AES
+    HAS_CRYPTO = True
+except ImportError:
+    AES = None
+    HAS_CRYPTO = False
+
+# yt-dlp is used as external yt-dlp.exe.
+# This keeps Nuitka builds much smaller and avoids compiling the huge yt_dlp Python package.
+
+
+# ============================================================
+# ClipVault Downloader - CLEAN REBUILD
+# ============================================================
+# Features:
+# - CapCut-ähnliche Dark UI
+# - Direkte Video-Dateilinks: MP4, WEBM, MKV, MOV, AVI, M4V
+# - Webseiten-Downloads über yt-dlp
+# - Qualität: Beste, 1080p, 720p, 480p, Audio MP3
+# - Ausgabe: MP4, MKV, WEBM
+# - Playlist optional
+# - Direkter Datei-Download mit größeren Chunks
+# - Bessere Timeouts
+# - FFmpeg-Erkennung im PATH und im gleichen Ordner wie diese Datei
+# - Download abbrechen
+# - Fortschritt, Speed, ETA, Log
+#
+# Hinweis:
+# Nur für Inhalte verwenden, an denen du Rechte hast.
+# Kein DRM-, Paywall-, Login- oder Schutz-Bypass.
+# ============================================================
+
+APP_NAME = "ClipVault Downloader"
+APP_VERSION = "1.0"
+
+DIRECT_VIDEO_EXTENSIONS = (".mp4", ".webm", ".mkv", ".mov", ".avi", ".m4v")
+DIRECT_AUDIO_EXTENSIONS = (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac")
+
+BG = "#0f0f12"
+SIDEBAR = "#15151a"
+CARD = "#17171d"
+CARD2 = "#141419"
+BORDER = "#272734"
+INPUT = "#101014"
+TEXT = "#ffffff"
+MUTED = "#8f8f9b"
+GREEN = "#00d084"
+GREEN_HOVER = "#00b874"
+RED = "#ff4d4d"
+RED_HOVER = "#d93a3a"
+
+LICENSE_API_URL = "https://clipvault-license-api.kollekive-774.workers.dev"
+OFFLINE_CACHE_DAYS = 30
+APP_CACHE_DIR = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "ClipVaultDownloader"
+LICENSE_CACHE_FILE = APP_CACHE_DIR / "license_cache.dat"
+
+YTDLP_EXE_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+FFMPEG_ZIP_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+
+
+def get_device_fingerprint() -> str:
+    raw = "|".join([
+        platform.node(),
+        platform.system(),
+        platform.release(),
+        os.getenv("USERNAME", ""),
+        str(Path.home()),
+    ])
+    return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def cache_secret() -> bytes:
+    raw = "ClipVaultOfflineCache|" + get_device_fingerprint()
+    return hashlib.sha256(raw.encode("utf-8")).digest()
+
+
+def xor_bytes(data: bytes, key: bytes) -> bytes:
+    return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
+
+
+def save_offline_license(normalized_key: str):
+    try:
+        APP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(days=OFFLINE_CACHE_DAYS)
+
+        payload = {
+            "key_hash": hashlib.sha256(normalized_key.encode("utf-8")).hexdigest(),
+            "device": get_device_fingerprint(),
+            "issued_at": now.isoformat(),
+            "expires_at": expires_at.isoformat(),
+            "version": APP_VERSION,
+        }
+
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        encrypted = xor_bytes(raw, cache_secret())
+        encoded = base64.urlsafe_b64encode(encrypted).decode("ascii")
+        LICENSE_CACHE_FILE.write_text(encoded, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_offline_license() -> tuple[bool, str]:
+    try:
+        if not LICENSE_CACHE_FILE.exists():
+            return False, "No offline license cache found."
+
+        encoded = LICENSE_CACHE_FILE.read_text(encoding="utf-8").strip()
+        encrypted = base64.urlsafe_b64decode(encoded.encode("ascii"))
+        raw = xor_bytes(encrypted, cache_secret())
+        payload = json.loads(raw.decode("utf-8"))
+
+        if payload.get("device") != get_device_fingerprint():
+            return False, "Offline license belongs to another device."
+
+        expires_at = datetime.fromisoformat(payload.get("expires_at"))
+        now = datetime.now(timezone.utc)
+
+        if now > expires_at:
+            return False, "Offline license expired. Please login online again."
+
+        remaining = expires_at - now
+        days_left = max(0, remaining.days)
+        return True, f"Offline license valid. {days_left} days left."
+    except Exception:
+        return False, "Offline license cache invalid."
+
+
+def has_internet_connection() -> bool:
+    """
+    Checks if the Cloudflare license worker is reachable.
+    Uses GET intentionally. The Worker returns POST only when reachable,
+    which still means online.
+    """
+    try:
+        response = requests.get(LICENSE_API_URL, timeout=5)
+        return response.status_code in (200, 400, 405)
+    except Exception:
+        return False
+
+
+
+def mega_b64_decode(data: str) -> bytes:
+    data = str(data).replace("-", "+").replace("_", "/")
+    data += "=" * ((4 - len(data) % 4) % 4)
+    return base64.b64decode(data)
+
+
+def mega_b64_to_a32(data: str):
+    raw = mega_b64_decode(data)
+    return list(struct.unpack(">%dI" % (len(raw) // 4), raw))
+
+
+def is_mega_url(url: str) -> bool:
+    lowered = url.lower()
+    return "mega.nz/file/" in lowered or "mega.co.nz/#!" in lowered
+
+
+def is_mega_folder_url(url: str) -> bool:
+    lowered = url.lower()
+    return "mega.nz/folder/" in lowered or "mega.nz/#f!" in lowered
+
+
+def parse_mega_file_url(url: str):
+    """
+    Supports:
+    https://mega.nz/file/<file_id>#<key>
+    https://mega.co.nz/#!<file_id>!<key>
+    """
+    parsed = urlparse(url)
+
+    if "mega.nz" in parsed.netloc.lower():
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) >= 2 and parts[0].lower() == "file":
+            file_id = parts[1]
+            file_key = parsed.fragment.strip()
+            if file_id and file_key:
+                return file_id, file_key
+
+    if "mega.co.nz" in parsed.netloc.lower():
+        frag = parsed.fragment.strip()
+        if frag.startswith("!"):
+            parts = frag.split("!")
+            if len(parts) >= 3:
+                return parts[1], parts[2]
+
+    return None, None
+
+
+def mega_file_key_and_nonce(key_string: str):
+    key_a32 = mega_b64_to_a32(key_string)
+
+    if len(key_a32) < 8:
+        raise ValueError("Ungültiger MEGA-Key.")
+
+    file_key_a32 = [
+        key_a32[0] ^ key_a32[4],
+        key_a32[1] ^ key_a32[5],
+        key_a32[2] ^ key_a32[6],
+        key_a32[3] ^ key_a32[7],
+    ]
+
+    file_key = struct.pack(">4I", *file_key_a32)
+    nonce = struct.pack(">2I", key_a32[4], key_a32[5])
+    return file_key, nonce
+
+
+def mega_decrypt_attributes(attr_string: str, file_key: bytes) -> dict:
+    if not attr_string:
+        return {}
+
+    raw = mega_b64_decode(attr_string)
+    cipher = AES.new(file_key, AES.MODE_CBC, iv=b"\x00" * 16)
+    decrypted = cipher.decrypt(raw)
+    decrypted = decrypted.rstrip(b"\x00")
+
+    if not decrypted.startswith(b"MEGA"):
+        return {}
+
+    try:
+        return json.loads(decrypted[4:].decode("utf-8", errors="replace"))
+    except Exception:
+        return {}
+
+
+LANGUAGES = ["English", "Deutsch", "Spanish", "Italian", "French"]
+
+TR = {
+    "English": {
+        "login_title": "License Login",
+        "login_subtitle": "Enter your 12-character access key.",
+        "login_placeholder": "XXXX-XXXX-XXXX",
+        "login_button": "Login",
+        "login_error": "Invalid key. Please check your license key.",
+        "login_success": "Login successful.",
+        "downloader": "Downloader",
+        "open_folder": "Open folder",
+        "check_link": "Check link",
+        "update_ytdlp": "Update yt-dlp",
+        "download_studio": "Download Studio",
+        "subtitle": "Paste link, choose mode, start download.",
+        "video_link": "Video link",
+        "url_placeholder": "https://site.com/video.mp4 or supported video page",
+        "mode": "Mode",
+        "quality": "Quality",
+        "output": "Output",
+        "speed_profile": "Speed profile",
+        "playlist": "Allow playlist",
+        "clean_names": "Clean filenames",
+        "playlist_info": "If enabled, links to playlists, channels, profiles or pages with multiple videos can download all detected entries instead of only one single video. If disabled, the tool tries to download only the currently selected single item.",
+        "clean_names_info": "If enabled, the tool automatically removes or replaces invalid and problematic filename characters. This helps prevent save errors on Windows and creates safer, cleaner and more compatible file names.",
+        "choose_folder": "Choose folder",
+        "ready": "Ready",
+        "start_download": "Start download",
+        "cancel": "Cancel",
+        "language": "Language",
+        "note": "Note:\nDirect MP4 links and many websites work.\n\nNot supported:\nDRM, paywalls, login bypass or protected streams.",
+        "ffmpeg_found": "FFmpeg: found",
+        "ffmpeg_missing": "FFmpeg: missing",
+        "ffprobe_found": "ffprobe: found",
+        "ffprobe_missing": "ffprobe: missing",
+    },
+    "Deutsch": {
+        "login_title": "Lizenz Login",
+        "login_subtitle": "Enter your 12-character access key.",
+        "login_placeholder": "XXXX-XXXX-XXXX",
+        "login_button": "Login",
+        "login_error": "Ungültiger Key. Bitte Lizenzschlüssel prüfen.",
+        "login_success": "Login erfolgreich.",
+        "downloader": "Downloader",
+        "open_folder": "Ordner öffnen",
+        "check_link": "Link prüfen",
+        "update_ytdlp": "yt-dlp aktualisieren",
+        "download_studio": "Download Studio",
+        "subtitle": "Link einfügen, Modus wählen, Download starten.",
+        "video_link": "Video-Link",
+        "url_placeholder": "https://seite.de/video.mp4 oder unterstützte Videoseite",
+        "mode": "Modus",
+        "quality": "Qualität",
+        "output": "Ausgabe",
+        "speed_profile": "Speed-Profil",
+        "playlist": "Playlist erlauben",
+        "clean_names": "Saubere Dateinamen",
+        "playlist_info": "Wenn aktiviert, können Links zu Playlists, Kanälen, Profilen oder Seiten mit mehreren Videos alle erkannten Einträge herunterladen statt nur eines einzelnen Videos. Wenn deaktiviert, versucht das Tool nur den aktuell ausgewählten einzelnen Eintrag herunterzuladen.",
+        "clean_names_info": "Wenn aktiviert, entfernt oder ersetzt das Tool ungültige und problematische Zeichen im Dateinamen automatisch. Das hilft, Speicherfehler unter Windows zu vermeiden und sorgt für sauberere, sicherere und besser kompatible Dateinamen.",
+        "choose_folder": "Ordner wählen",
+        "ready": "Bereit",
+        "start_download": "Download starten",
+        "cancel": "Abbrechen",
+        "language": "Sprache",
+        "note": "Hinweis:\nDirekte MP4-Links, MEGA-Dateilinks und viele Webseiten gehen.\n\nNicht unterstützt:\nDRM, Paywalls, Login-Bypass oder geschützte Streams.",
+        "ffmpeg_found": "FFmpeg: gefunden",
+        "ffmpeg_missing": "FFmpeg: fehlt",
+        "ffprobe_found": "ffprobe: gefunden",
+        "ffprobe_missing": "ffprobe: fehlt",
+    },
+    "Spanish": {
+        "login_title": "Inicio de licencia",
+        "login_subtitle": "Enter your 12-character access key.",
+        "login_placeholder": "XXXX-XXXX-XXXX",
+        "login_button": "Login",
+        "login_error": "Clave inválida. Revisa tu licencia.",
+        "login_success": "Inicio correcto.",
+        "downloader": "Descargador",
+        "open_folder": "Abrir carpeta",
+        "check_link": "Comprobar enlace",
+        "update_ytdlp": "Actualizar yt-dlp",
+        "download_studio": "Estudio de descarga",
+        "subtitle": "Pega el enlace, elige modo e inicia.",
+        "video_link": "Enlace de video",
+        "url_placeholder": "https://sitio.com/video.mp4 o página compatible",
+        "mode": "Modo",
+        "quality": "Calidad",
+        "output": "Salida",
+        "speed_profile": "Perfil de velocidad",
+        "playlist": "Permitir playlist",
+        "clean_names": "Nombres limpios",
+        "playlist_info": "Si está activado, los enlaces a listas de reproducción, canales, perfiles o páginas con varios videos podrán descargar todas las entradas detectadas en lugar de un solo video. Si está desactivado, la herramienta intentará descargar solo el elemento actual.",
+        "clean_names_info": "Si está activado, la herramienta elimina o reemplaza automáticamente los caracteres no válidos o problemáticos del nombre del archivo. Esto ayuda a evitar errores al guardar en Windows y crea nombres más limpios, seguros y compatibles.",
+        "choose_folder": "Elegir carpeta",
+        "ready": "Listo",
+        "start_download": "Iniciar descarga",
+        "cancel": "Cancelar",
+        "language": "Idioma",
+        "note": "Nota:\nFuncionan enlaces MP4 directos y muchas webs.\n\nNo soportado:\nDRM, paywalls, bypass de login o streams protegidos.",
+        "ffmpeg_found": "FFmpeg: encontrado",
+        "ffmpeg_missing": "FFmpeg: falta",
+        "ffprobe_found": "ffprobe: encontrado",
+        "ffprobe_missing": "ffprobe: falta",
+    },
+    "Italian": {
+        "login_title": "Accesso licenza",
+        "login_subtitle": "Enter your 12-character access key.",
+        "login_placeholder": "XXXX-XXXX-XXXX",
+        "login_button": "Login",
+        "login_error": "Chiave non valida. Controlla la licenza.",
+        "login_success": "Accesso riuscito.",
+        "downloader": "Downloader",
+        "open_folder": "Apri cartella",
+        "check_link": "Controlla link",
+        "update_ytdlp": "Aggiorna yt-dlp",
+        "download_studio": "Studio download",
+        "subtitle": "Incolla il link, scegli la modalità e avvia.",
+        "video_link": "Link video",
+        "url_placeholder": "https://sito.com/video.mp4 o pagina supportata",
+        "mode": "Modalità",
+        "quality": "Qualità",
+        "output": "Output",
+        "speed_profile": "Profilo velocità",
+        "playlist": "Consenti playlist",
+        "clean_names": "Nomi file puliti",
+        "choose_folder": "Scegli cartella",
+        "ready": "Pronto",
+        "start_download": "Avvia download",
+        "cancel": "Annulla",
+        "language": "Lingua",
+        "note": "Nota:\nFunzionano link MP4 diretti e molti siti.\n\nNon supportato:\nDRM, paywall, bypass login o stream protetti.",
+        "ffmpeg_found": "FFmpeg: trovato",
+        "ffmpeg_missing": "FFmpeg: mancante",
+        "ffprobe_found": "ffprobe: trovato",
+        "ffprobe_missing": "ffprobe: mancante",
+    },
+    "French": {
+        "login_title": "Connexion licence",
+        "login_subtitle": "Enter your 12-character access key.",
+        "login_placeholder": "XXXX-XXXX-XXXX",
+        "login_button": "Login",
+        "login_error": "Clé invalide. Vérifie ta licence.",
+        "login_success": "Connexion réussie.",
+        "downloader": "Téléchargeur",
+        "open_folder": "Ouvrir dossier",
+        "check_link": "Vérifier lien",
+        "update_ytdlp": "Mettre à jour yt-dlp",
+        "download_studio": "Studio de téléchargement",
+        "subtitle": "Colle le lien, choisis le mode et démarre.",
+        "video_link": "Lien vidéo",
+        "url_placeholder": "https://site.com/video.mp4 ou page compatible",
+        "mode": "Mode",
+        "quality": "Qualité",
+        "output": "Sortie",
+        "speed_profile": "Profil vitesse",
+        "playlist": "Autoriser playlist",
+        "clean_names": "Noms propres",
+        "playlist_info": "Si activé, les liens vers des playlists, des chaînes, des profils ou des pages contenant plusieurs vidéos peuvent télécharger toutes les entrées détectées au lieu d'une seule vidéo. Si désactivé, l'outil essaiera de télécharger uniquement l'élément actuellement sélectionné.",
+        "clean_names_info": "Si activé, l'outil supprime ou remplace automatiquement les caractères de nom de fichier invalides ou problématiques. Cela aide à éviter les erreurs d'enregistrement sous Windows et crée des noms de fichiers plus propres, plus sûrs et plus compatibles.",
+        "choose_folder": "Choisir dossier",
+        "ready": "Prêt",
+        "start_download": "Démarrer",
+        "cancel": "Annuler",
+        "language": "Langue",
+        "note": "Note:\nLes liens MP4 directs et beaucoup de sites fonctionnent.\n\nNon supporté:\nDRM, paywalls, bypass login ou streams protégés.",
+        "ffmpeg_found": "FFmpeg: trouvé",
+        "ffmpeg_missing": "FFmpeg: manquant",
+        "ffprobe_found": "ffprobe: trouvé",
+        "ffprobe_missing": "ffprobe: manquant",
+    },
+}
+
+
+# ============================================================
+# Central translation and option synchronization
+# ============================================================
+# All UI-only labels are normalized here so language switching does not break logic.
+TR_SYNC = {
+    "English": {
+        "requirements": "Additional downloads",
+        "ytdlp_found": "yt-dlp: found",
+        "ytdlp_missing": "yt-dlp: missing",
+        "mega_ready": "MEGA: ready",
+        "mega_crypto_missing": "MEGA: pycryptodome missing",
+        "yes": "Yes",
+        "no": "No",
+        "running": "Running...",
+        "cancel_requested": "Cancel requested...",
+        "invalid_link_title": "Invalid link",
+        "invalid_link_message": "Please paste a valid http:// or https:// link.",
+        "checking_link": "Checking link...",
+        "check_failed": "Check failed.",
+        "direct_check_ok": "Direct file link detected.",
+        "unknown_size": "Unknown",
+        "mega_folder_unsupported": "MEGA folder links are not supported yet. Please use a MEGA file link.",
+        "mega_folder_status": "MEGA folder link not supported.",
+        "mega_missing_status": "MEGA support missing.",
+        "mega_invalid": "Invalid MEGA file link.",
+        "mega_invalid_status": "Invalid MEGA link.",
+        "mega_file_detected": "MEGA file detected",
+        "mega_size": "Size",
+        "mega_status_ok": "MEGA file link detected.",
+        "ytdlp_missing_long": "yt-dlp.exe is missing. Put yt-dlp.exe into the tool folder or use Additional downloads.",
+        "ytdlp_info_error": "yt-dlp info error",
+        "link_check_no_info": "No info found.",
+        "link_detected": "Link detected.",
+        "playlist_detected": "Playlist detected",
+        "entries": "Entries",
+        "title": "Title",
+        "duration": "Duration",
+        "uploader": "Uploader",
+        "download_starting": "Download starting...",
+        "finished": "Finished.",
+        "download_done": "Download completed.",
+        "cancelled": "Cancelled.",
+        "error": "Error",
+        "info": "Info",
+        "direct_running": "Direct file download running...",
+        "turbo_active": "Turbo mode active",
+        "turbo_unavailable": "Turbo mode unavailable. Using stable stream download.",
+        "saving_as": "Saving as",
+        "saved": "Saved",
+        "filesize": "File size",
+        "combining_parts": "Combining parts...",
+        "mega_running": "MEGA download running...",
+        "mega_saved": "MEGA saved",
+        "mega_speed_profile": "MEGA speed profile",
+        "yt_running": "yt-dlp download running...",
+        "yt_done": "yt-dlp download finished.",
+        "yt_error_exit": "yt-dlp error. Exit code",
+        "processing_file": "Processing file...",
+        "requirements_done": "Additional downloads",
+    },
+    "Deutsch": {
+        "requirements": "Zusätzliche Downloads",
+        "ytdlp_found": "yt-dlp: gefunden",
+        "ytdlp_missing": "yt-dlp: fehlt",
+        "mega_ready": "MEGA: bereit",
+        "mega_crypto_missing": "MEGA: pycryptodome fehlt",
+        "yes": "Ja",
+        "no": "Nein",
+        "running": "Läuft...",
+        "cancel_requested": "Abbruch angefordert...",
+        "invalid_link_title": "Ungültiger Link",
+        "invalid_link_message": "Bitte einen gültigen http:// oder https:// Link einfügen.",
+        "checking_link": "Link wird geprüft...",
+        "check_failed": "Prüfung fehlgeschlagen.",
+        "direct_check_ok": "Direkter Datei-Link erkannt.",
+        "unknown_size": "Unbekannt",
+        "mega_folder_unsupported": "MEGA-Ordnerlinks werden aktuell noch nicht unterstützt. Bitte einen MEGA-Dateilink nutzen.",
+        "mega_folder_status": "MEGA-Ordnerlink nicht unterstützt.",
+        "mega_missing_status": "MEGA-Support fehlt.",
+        "mega_invalid": "Ungültiger MEGA-Dateilink.",
+        "mega_invalid_status": "Ungültiger MEGA-Link.",
+        "mega_file_detected": "MEGA-Datei erkannt",
+        "mega_size": "Größe",
+        "mega_status_ok": "MEGA-Dateilink erkannt.",
+        "ytdlp_missing_long": "yt-dlp.exe fehlt. Lege yt-dlp.exe in den Tool-Ordner oder nutze Zusätzliche Downloads.",
+        "ytdlp_info_error": "yt-dlp Info-Fehler",
+        "link_check_no_info": "Keine Info gefunden.",
+        "link_detected": "Link erkannt.",
+        "playlist_detected": "Playlist erkannt",
+        "entries": "Einträge",
+        "title": "Titel",
+        "duration": "Dauer",
+        "uploader": "Uploader",
+        "download_starting": "Download startet...",
+        "finished": "Fertig.",
+        "download_done": "Download abgeschlossen.",
+        "cancelled": "Abgebrochen.",
+        "error": "Fehler",
+        "info": "Info",
+        "direct_running": "Direkter Datei-Download läuft...",
+        "turbo_active": "Turbo-Modus aktiv",
+        "turbo_unavailable": "Turbo-Modus nicht verfügbar. Nutze normalen Stream-Download.",
+        "saving_as": "Speichere als",
+        "saved": "Gespeichert",
+        "filesize": "Dateigröße",
+        "combining_parts": "Setze Teile zusammen...",
+        "mega_running": "MEGA-Download läuft...",
+        "mega_saved": "MEGA gespeichert",
+        "mega_speed_profile": "MEGA Speed-Profil",
+        "yt_running": "yt-dlp Download läuft...",
+        "yt_done": "yt-dlp Download fertig.",
+        "yt_error_exit": "yt-dlp Fehler. Exit-Code",
+        "processing_file": "Verarbeite Datei...",
+        "requirements_done": "Zusätzliche Downloads",
+    },
+    "Spanish": {
+        "requirements": "Descargas adicionales",
+        "ytdlp_found": "yt-dlp: encontrado",
+        "ytdlp_missing": "yt-dlp: falta",
+        "mega_ready": "MEGA: listo",
+        "mega_crypto_missing": "MEGA: falta pycryptodome",
+        "yes": "Sí",
+        "no": "No",
+        "running": "En ejecución...",
+        "cancel_requested": "Cancelación solicitada...",
+        "invalid_link_title": "Enlace no válido",
+        "invalid_link_message": "Pega un enlace http:// o https:// válido.",
+        "checking_link": "Comprobando enlace...",
+        "check_failed": "Comprobación fallida.",
+        "direct_check_ok": "Enlace de archivo directo detectado.",
+        "unknown_size": "Desconocido",
+        "mega_folder_unsupported": "Los enlaces de carpetas MEGA aún no son compatibles. Usa un enlace de archivo MEGA.",
+        "mega_folder_status": "Carpeta MEGA no compatible.",
+        "mega_missing_status": "Falta soporte MEGA.",
+        "mega_invalid": "Enlace de archivo MEGA no válido.",
+        "mega_invalid_status": "Enlace MEGA no válido.",
+        "mega_file_detected": "Archivo MEGA detectado",
+        "mega_size": "Tamaño",
+        "mega_status_ok": "Enlace de archivo MEGA detectado.",
+        "ytdlp_missing_long": "Falta yt-dlp.exe. Pon yt-dlp.exe en la carpeta de la herramienta o usa Descargas adicionales.",
+        "ytdlp_info_error": "Error de información de yt-dlp",
+        "link_check_no_info": "No se encontró información.",
+        "link_detected": "Enlace detectado.",
+        "playlist_detected": "Playlist detectada",
+        "entries": "Entradas",
+        "title": "Título",
+        "duration": "Duración",
+        "uploader": "Uploader",
+        "download_starting": "Iniciando descarga...",
+        "finished": "Terminado.",
+        "download_done": "Descarga completada.",
+        "cancelled": "Cancelado.",
+        "error": "Error",
+        "info": "Info",
+        "direct_running": "Descarga directa en curso...",
+        "turbo_active": "Modo turbo activo",
+        "turbo_unavailable": "Modo turbo no disponible. Usando descarga estable.",
+        "saving_as": "Guardando como",
+        "saved": "Guardado",
+        "filesize": "Tamaño de archivo",
+        "combining_parts": "Uniendo partes...",
+        "mega_running": "Descarga MEGA en curso...",
+        "mega_saved": "MEGA guardado",
+        "mega_speed_profile": "Perfil de velocidad MEGA",
+        "yt_running": "Descarga yt-dlp en curso...",
+        "yt_done": "Descarga yt-dlp terminada.",
+        "yt_error_exit": "Error de yt-dlp. Código de salida",
+        "processing_file": "Procesando archivo...",
+        "requirements_done": "Descargas adicionales",
+    },
+    "Italian": {
+        "playlist_info": "Se attivato, i link a playlist, canali, profili o pagine con più video possono scaricare tutte le voci rilevate invece di un solo video. Se disattivato, lo strumento prova a scaricare solo l'elemento corrente.",
+        "clean_names_info": "Se attivato, lo strumento rimuove o sostituisce automaticamente i caratteri non validi o problematici nei nomi dei file. Questo aiuta a evitare errori di salvataggio su Windows e crea nomi più puliti, sicuri e compatibili.",
+        "requirements": "Download aggiuntivi",
+        "ytdlp_found": "yt-dlp: trovato",
+        "ytdlp_missing": "yt-dlp: mancante",
+        "mega_ready": "MEGA: pronto",
+        "mega_crypto_missing": "MEGA: pycryptodome mancante",
+        "yes": "Sì",
+        "no": "No",
+        "running": "In esecuzione...",
+        "cancel_requested": "Annullamento richiesto...",
+        "invalid_link_title": "Link non valido",
+        "invalid_link_message": "Inserisci un link http:// o https:// valido.",
+        "checking_link": "Controllo link...",
+        "check_failed": "Controllo fallito.",
+        "direct_check_ok": "Link file diretto rilevato.",
+        "unknown_size": "Sconosciuta",
+        "mega_folder_unsupported": "I link alle cartelle MEGA non sono ancora supportati. Usa un link file MEGA.",
+        "mega_folder_status": "Cartella MEGA non supportata.",
+        "mega_missing_status": "Supporto MEGA mancante.",
+        "mega_invalid": "Link file MEGA non valido.",
+        "mega_invalid_status": "Link MEGA non valido.",
+        "mega_file_detected": "File MEGA rilevato",
+        "mega_size": "Dimensione",
+        "mega_status_ok": "Link file MEGA rilevato.",
+        "ytdlp_missing_long": "yt-dlp.exe mancante. Metti yt-dlp.exe nella cartella dello strumento o usa Download aggiuntivi.",
+        "ytdlp_info_error": "Errore informazioni yt-dlp",
+        "link_check_no_info": "Nessuna informazione trovata.",
+        "link_detected": "Link rilevato.",
+        "playlist_detected": "Playlist rilevata",
+        "entries": "Voci",
+        "title": "Titolo",
+        "duration": "Durata",
+        "uploader": "Uploader",
+        "download_starting": "Avvio download...",
+        "finished": "Finito.",
+        "download_done": "Download completato.",
+        "cancelled": "Annullato.",
+        "error": "Errore",
+        "info": "Info",
+        "direct_running": "Download diretto in corso...",
+        "turbo_active": "Modalità turbo attiva",
+        "turbo_unavailable": "Modalità turbo non disponibile. Uso download stabile.",
+        "saving_as": "Salvataggio come",
+        "saved": "Salvato",
+        "filesize": "Dimensione file",
+        "combining_parts": "Unione parti...",
+        "mega_running": "Download MEGA in corso...",
+        "mega_saved": "MEGA salvato",
+        "mega_speed_profile": "Profilo velocità MEGA",
+        "yt_running": "Download yt-dlp in corso...",
+        "yt_done": "Download yt-dlp terminato.",
+        "yt_error_exit": "Errore yt-dlp. Codice uscita",
+        "processing_file": "Elaborazione file...",
+        "requirements_done": "Download aggiuntivi",
+    },
+    "French": {
+        "requirements": "Téléchargements supplémentaires",
+        "ytdlp_found": "yt-dlp: trouvé",
+        "ytdlp_missing": "yt-dlp: manquant",
+        "mega_ready": "MEGA: prêt",
+        "mega_crypto_missing": "MEGA: pycryptodome manquant",
+        "yes": "Oui",
+        "no": "Non",
+        "running": "En cours...",
+        "cancel_requested": "Annulation demandée...",
+        "invalid_link_title": "Lien invalide",
+        "invalid_link_message": "Colle un lien http:// ou https:// valide.",
+        "checking_link": "Vérification du lien...",
+        "check_failed": "Vérification échouée.",
+        "direct_check_ok": "Lien de fichier direct détecté.",
+        "unknown_size": "Inconnue",
+        "mega_folder_unsupported": "Les liens de dossiers MEGA ne sont pas encore pris en charge. Utilise un lien de fichier MEGA.",
+        "mega_folder_status": "Dossier MEGA non pris en charge.",
+        "mega_missing_status": "Support MEGA manquant.",
+        "mega_invalid": "Lien de fichier MEGA invalide.",
+        "mega_invalid_status": "Lien MEGA invalide.",
+        "mega_file_detected": "Fichier MEGA détecté",
+        "mega_size": "Taille",
+        "mega_status_ok": "Lien de fichier MEGA détecté.",
+        "ytdlp_missing_long": "yt-dlp.exe manque. Mets yt-dlp.exe dans le dossier de l'outil ou utilise Téléchargements supplémentaires.",
+        "ytdlp_info_error": "Erreur d'information yt-dlp",
+        "link_check_no_info": "Aucune info trouvée.",
+        "link_detected": "Lien détecté.",
+        "playlist_detected": "Playlist détectée",
+        "entries": "Entrées",
+        "title": "Titre",
+        "duration": "Durée",
+        "uploader": "Uploader",
+        "download_starting": "Démarrage du téléchargement...",
+        "finished": "Terminé.",
+        "download_done": "Téléchargement terminé.",
+        "cancelled": "Annulé.",
+        "error": "Erreur",
+        "info": "Info",
+        "direct_running": "Téléchargement direct en cours...",
+        "turbo_active": "Mode turbo actif",
+        "turbo_unavailable": "Mode turbo indisponible. Utilisation du téléchargement stable.",
+        "saving_as": "Enregistrement sous",
+        "saved": "Enregistré",
+        "filesize": "Taille du fichier",
+        "combining_parts": "Assemblage des parties...",
+        "mega_running": "Téléchargement MEGA en cours...",
+        "mega_saved": "MEGA enregistré",
+        "mega_speed_profile": "Profil vitesse MEGA",
+        "yt_running": "Téléchargement yt-dlp en cours...",
+        "yt_done": "Téléchargement yt-dlp terminé.",
+        "yt_error_exit": "Erreur yt-dlp. Code de sortie",
+        "processing_file": "Traitement du fichier...",
+        "requirements_done": "Téléchargements supplémentaires",
+    },
+}
+
+for _lang, _values in TR_SYNC.items():
+    TR.setdefault(_lang, {})
+    TR[_lang].update(_values)
+
+
+TR_EXTRA = {
+    "English": {
+        "app_started": "Ready. Online license version started.",
+        "license_worker": "License check runs through Cloudflare Worker.",
+        "offline_login_hint": "After successful online login, 30 days offline start is possible.",
+        "supported_links_log": "Direct MP4/WEBM/MKV/MOV/MP3 links + many websites via yt-dlp.",
+        "turbo_log": "Turbo mode: direct files can be downloaded with multiple parallel connections.",
+        "ffmpeg_found_log": "FFmpeg found",
+        "ffmpeg_missing_log": "FFmpeg not found. Put ffmpeg.exe in the same folder as this file or install FFmpeg.",
+        "ytdlp_found_log": "yt-dlp found",
+        "ytdlp_missing_log": "yt-dlp.exe not found. Put yt-dlp.exe in the same folder as this file.",
+        "ytdlp_missing_toast_title": "yt-dlp.exe missing",
+        "ytdlp_missing_toast_message": "Click Additional downloads on the left. Without yt-dlp.exe, website downloads will not work. Direct MP4 links can still work.",
+        "mega_ready_log": "MEGA support ready.",
+        "mega_missing_log": "MEGA support unavailable: pycryptodome missing. Install: pip install pycryptodome",
+        "mega_missing_toast_title": "MEGA support missing",
+        "mega_missing_toast_message": "pycryptodome is required for MEGA links. Click Additional downloads to install it automatically.",
+        "requirements_question": "Do you want to download the required files now?",
+        "wait_title": "Please wait",
+        "already_downloading": "The required files are already being downloaded.",
+        "requirements_desc": "yt-dlp.exe: detects video websites and fetches the real video/audio links.\n\nffmpeg.exe: merges video and audio and converts formats like MP4/MP3.\n\nffprobe.exe: reads media information, e.g. streams, duration and format.\n\npycryptodome: required for MEGA links because MEGA files are transferred encrypted and decrypted locally.",
+        "requirements_cancelled": "The required files download was not started.",
+        "installing": "Installing...",
+        "requirements_start": "Download starts: yt-dlp.exe, ffmpeg.exe and ffprobe.exe are checked/installed.",
+        "requirements_started_log": "Additional downloads installation started.",
+        "download_ytdlp_status": "Downloading yt-dlp.exe...",
+        "download_ffmpeg_status": "Downloading FFmpeg package...",
+        "install_crypto_status": "Installing pycryptodome for MEGA support...",
+        "installed": "Installed",
+        "already_present": "Already present",
+        "all_present": "All required files are present.",
+        "requirements_finished": "Additional downloads finished.",
+        "requirements_error": "Additional downloads error.",
+        "mp3_conversion_start": "Converting to MP3...",
+        "mp3_conversion_done": "MP3 conversion finished",
+        "mp3_requires_ffmpeg": "MP3 conversion requires FFmpeg. Install FFmpeg or click Additional downloads.",
+        "mp3_output_enabled": "MP3 output enabled: audio will be extracted/converted when possible.",
+    },
+    "Deutsch": {
+        "app_started": "Bereit. Online-License Version gestartet.",
+        "license_worker": "Lizenzprüfung läuft über Cloudflare Worker.",
+        "offline_login_hint": "Nach erfolgreichem Online-Login ist 30 Tage Offline-Start möglich.",
+        "supported_links_log": "Direkte MP4/WEBM/MKV/MOV/MP3 Links + viele Webseiten über yt-dlp.",
+        "turbo_log": "Turbo-Modus: Direkte Dateien können mit mehreren Verbindungen parallel geladen werden.",
+        "ffmpeg_found_log": "FFmpeg gefunden",
+        "ffmpeg_missing_log": "FFmpeg nicht gefunden. Lege ffmpeg.exe in den gleichen Ordner wie diese Datei oder installiere FFmpeg.",
+        "ytdlp_found_log": "yt-dlp gefunden",
+        "ytdlp_missing_log": "yt-dlp.exe nicht gefunden. Lege yt-dlp.exe in den gleichen Ordner wie diese Datei.",
+        "ytdlp_missing_toast_title": "yt-dlp.exe fehlt",
+        "ytdlp_missing_toast_message": "Klicke links im Menü auf Zusätzliche Downloads. Ohne yt-dlp.exe funktionieren Webseiten-Downloads nicht. Direkte MP4-Links können trotzdem funktionieren.",
+        "mega_ready_log": "MEGA-Support bereit.",
+        "mega_missing_log": "MEGA-Support nicht verfügbar: pycryptodome fehlt. Installiere: pip install pycryptodome",
+        "mega_missing_toast_title": "MEGA-Support fehlt",
+        "mega_missing_toast_message": "Für MEGA-Links wird pycryptodome benötigt. Klicke auf Zusätzliche Downloads, um es automatisch zu installieren.",
+        "requirements_question": "Willst du die benötigten Dateien jetzt herunterladen?",
+        "wait_title": "Bitte warten",
+        "already_downloading": "Die benötigten Dateien werden bereits heruntergeladen.",
+        "requirements_desc": "yt-dlp.exe: erkennt Video-Webseiten und holt die echten Video-/Audio-Links.\n\nffmpeg.exe: fügt Video und Audio zusammen und wandelt Formate wie MP4/MP3 um.\n\nffprobe.exe: liest Medieninfos aus, z. B. Streams, Länge und Format.\n\npycryptodome: wird für MEGA-Links benötigt, weil MEGA-Dateien verschlüsselt übertragen und lokal entschlüsselt werden.",
+        "requirements_cancelled": "Download der benötigten Dateien wurde nicht gestartet.",
+        "installing": "Installiere...",
+        "requirements_start": "Download startet: yt-dlp.exe, ffmpeg.exe und ffprobe.exe werden geprüft/installiert.",
+        "requirements_started_log": "Zusätzliche Downloads Installation gestartet.",
+        "download_ytdlp_status": "Lade yt-dlp.exe herunter...",
+        "download_ffmpeg_status": "Lade FFmpeg Paket herunter...",
+        "install_crypto_status": "Installiere pycryptodome für MEGA-Support...",
+        "installed": "Installiert",
+        "already_present": "Schon vorhanden",
+        "all_present": "Alle benötigten Dateien sind vorhanden.",
+        "requirements_finished": "Zusätzliche Downloads fertig.",
+        "requirements_error": "Zusätzliche Downloads Fehler.",
+        "mp3_conversion_start": "Konvertiere zu MP3...",
+        "mp3_conversion_done": "MP3-Konvertierung fertig",
+        "mp3_requires_ffmpeg": "MP3-Konvertierung benötigt FFmpeg. Installiere FFmpeg oder klicke auf Zusätzliche Downloads.",
+        "mp3_output_enabled": "MP3-Ausgabe aktiv: Audio wird nach Möglichkeit extrahiert/konvertiert.",
+    },
+    "Spanish": {
+        "app_started": "Listo. Versión con licencia online iniciada.",
+        "license_worker": "La verificación de licencia se ejecuta mediante Cloudflare Worker.",
+        "offline_login_hint": "Tras iniciar sesión online correctamente, se permite inicio offline durante 30 días.",
+        "supported_links_log": "Enlaces directos MP4/WEBM/MKV/MOV + muchas webs vía yt-dlp.",
+        "turbo_log": "Modo turbo: los archivos directos pueden descargarse con varias conexiones paralelas.",
+        "ffmpeg_found_log": "FFmpeg encontrado",
+        "ffmpeg_missing_log": "FFmpeg no encontrado. Pon ffmpeg.exe en la misma carpeta o instala FFmpeg.",
+        "ytdlp_found_log": "yt-dlp encontrado",
+        "ytdlp_missing_log": "yt-dlp.exe no encontrado. Pon yt-dlp.exe en la misma carpeta.",
+        "ytdlp_missing_toast_title": "Falta yt-dlp.exe",
+        "ytdlp_missing_toast_message": "Haz clic en Descargas adicionales a la izquierda. Sin yt-dlp.exe, las descargas web no funcionarán. Los enlaces MP4 directos pueden seguir funcionando.",
+        "mega_ready_log": "Soporte MEGA listo.",
+        "mega_missing_log": "Soporte MEGA no disponible: falta pycryptodome. Instala: pip install pycryptodome",
+        "mega_missing_toast_title": "Falta soporte MEGA",
+        "mega_missing_toast_message": "pycryptodome es necesario para enlaces MEGA. Haz clic en Descargas adicionales para instalarlo automáticamente.",
+        "requirements_question": "¿Quieres descargar los archivos requeridos ahora?",
+        "wait_title": "Espera",
+        "already_downloading": "Los archivos requeridos ya se están descargando.",
+        "requirements_desc": "yt-dlp.exe: detecta webs de video y obtiene los enlaces reales de video/audio.\n\nffmpeg.exe: une video y audio y convierte formatos como MP4/MP3.\n\nffprobe.exe: lee información multimedia, por ejemplo streams, duración y formato.\n\npycryptodome: necesario para enlaces MEGA porque los archivos MEGA se transfieren cifrados y se descifran localmente.",
+        "requirements_cancelled": "La descarga de archivos requeridos no se inició.",
+        "installing": "Instalando...",
+        "requirements_start": "La descarga inicia: yt-dlp.exe, ffmpeg.exe y ffprobe.exe se comprueban/instalan.",
+        "requirements_started_log": "Instalación de descargas adicionales iniciada.",
+        "download_ytdlp_status": "Descargando yt-dlp.exe...",
+        "download_ffmpeg_status": "Descargando paquete FFmpeg...",
+        "install_crypto_status": "Instalando pycryptodome para soporte MEGA...",
+        "installed": "Instalado",
+        "already_present": "Ya presente",
+        "all_present": "Todos los archivos requeridos están presentes.",
+        "requirements_finished": "Descargas adicionales terminadas.",
+        "requirements_error": "Error de descargas adicionales.",
+        "mp3_conversion_start": "Convirtiendo a MP3...",
+        "mp3_conversion_done": "Conversión MP3 terminada",
+        "mp3_requires_ffmpeg": "La conversión MP3 requiere FFmpeg. Instala FFmpeg o haz clic en Descargas adicionales.",
+        "mp3_output_enabled": "Salida MP3 activada: el audio se extraerá/convertirá cuando sea posible.",
+    },
+    "Italian": {
+        "app_started": "Pronto. Versione licenza online avviata.",
+        "license_worker": "Il controllo licenza passa tramite Cloudflare Worker.",
+        "offline_login_hint": "Dopo un login online riuscito, è possibile l'avvio offline per 30 giorni.",
+        "supported_links_log": "Link diretti MP4/WEBM/MKV/MOV + molti siti tramite yt-dlp.",
+        "turbo_log": "Modalità turbo: i file diretti possono essere scaricati con più connessioni parallele.",
+        "ffmpeg_found_log": "FFmpeg trovato",
+        "ffmpeg_missing_log": "FFmpeg non trovato. Metti ffmpeg.exe nella stessa cartella o installa FFmpeg.",
+        "ytdlp_found_log": "yt-dlp trovato",
+        "ytdlp_missing_log": "yt-dlp.exe non trovato. Metti yt-dlp.exe nella stessa cartella.",
+        "ytdlp_missing_toast_title": "yt-dlp.exe mancante",
+        "ytdlp_missing_toast_message": "Clicca Download aggiuntivi a sinistra. Senza yt-dlp.exe i download dai siti non funzionano. I link MP4 diretti possono comunque funzionare.",
+        "mega_ready_log": "Supporto MEGA pronto.",
+        "mega_missing_log": "Supporto MEGA non disponibile: pycryptodome mancante. Installa: pip install pycryptodome",
+        "mega_missing_toast_title": "Supporto MEGA mancante",
+        "mega_missing_toast_message": "pycryptodome è necessario per i link MEGA. Clicca Download aggiuntivi per installarlo automaticamente.",
+        "requirements_question": "Vuoi scaricare ora i file richiesti?",
+        "wait_title": "Attendi",
+        "already_downloading": "I file richiesti sono già in download.",
+        "requirements_desc": "yt-dlp.exe: rileva siti video e ottiene i veri link video/audio.\n\nffmpeg.exe: unisce video e audio e converte formati come MP4/MP3.\n\nffprobe.exe: legge informazioni multimediali, ad es. stream, durata e formato.\n\npycryptodome: necessario per link MEGA perché i file MEGA vengono trasferiti criptati e decriptati localmente.",
+        "requirements_cancelled": "Il download dei file richiesti non è stato avviato.",
+        "installing": "Installazione...",
+        "requirements_start": "Download avviato: yt-dlp.exe, ffmpeg.exe e ffprobe.exe vengono controllati/installati.",
+        "requirements_started_log": "Installazione download aggiuntivi avviata.",
+        "download_ytdlp_status": "Download yt-dlp.exe...",
+        "download_ffmpeg_status": "Download pacchetto FFmpeg...",
+        "install_crypto_status": "Installazione pycryptodome per supporto MEGA...",
+        "installed": "Installato",
+        "already_present": "Già presente",
+        "all_present": "Tutti i file richiesti sono presenti.",
+        "requirements_finished": "Download aggiuntivi terminati.",
+        "requirements_error": "Errore download aggiuntivi.",
+        "mp3_conversion_start": "Conversione in MP3...",
+        "mp3_conversion_done": "Conversione MP3 completata",
+        "mp3_requires_ffmpeg": "La conversione MP3 richiede FFmpeg. Installa FFmpeg o clicca Download aggiuntivi.",
+        "mp3_output_enabled": "Output MP3 attivo: l'audio verrà estratto/convertito quando possibile.",
+    },
+    "French": {
+        "app_started": "Prêt. Version licence en ligne démarrée.",
+        "license_worker": "La vérification de licence passe par Cloudflare Worker.",
+        "offline_login_hint": "Après une connexion en ligne réussie, le démarrage hors ligne est possible pendant 30 jours.",
+        "supported_links_log": "Liens directs MP4/WEBM/MKV/MOV + beaucoup de sites via yt-dlp.",
+        "turbo_log": "Mode turbo : les fichiers directs peuvent être téléchargés avec plusieurs connexions parallèles.",
+        "ffmpeg_found_log": "FFmpeg trouvé",
+        "ffmpeg_missing_log": "FFmpeg introuvable. Mets ffmpeg.exe dans le même dossier ou installe FFmpeg.",
+        "ytdlp_found_log": "yt-dlp trouvé",
+        "ytdlp_missing_log": "yt-dlp.exe introuvable. Mets yt-dlp.exe dans le même dossier.",
+        "ytdlp_missing_toast_title": "yt-dlp.exe manquant",
+        "ytdlp_missing_toast_message": "Clique sur Téléchargements supplémentaires à gauche. Sans yt-dlp.exe, les téléchargements de sites ne fonctionneront pas. Les liens MP4 directs peuvent quand même fonctionner.",
+        "mega_ready_log": "Support MEGA prêt.",
+        "mega_missing_log": "Support MEGA indisponible : pycryptodome manquant. Installe : pip install pycryptodome",
+        "mega_missing_toast_title": "Support MEGA manquant",
+        "mega_missing_toast_message": "pycryptodome est requis pour les liens MEGA. Clique sur Téléchargements supplémentaires pour l'installer automatiquement.",
+        "requirements_question": "Veux-tu télécharger les fichiers requis maintenant ?",
+        "wait_title": "Patiente",
+        "already_downloading": "Les fichiers requis sont déjà en cours de téléchargement.",
+        "requirements_desc": "yt-dlp.exe : détecte les sites vidéo et récupère les vrais liens vidéo/audio.\n\nffmpeg.exe : fusionne vidéo et audio et convertit les formats comme MP4/MP3.\n\nffprobe.exe : lit les informations média, par ex. streams, durée et format.\n\npycryptodome : requis pour les liens MEGA car les fichiers MEGA sont transférés chiffrés et déchiffrés localement.",
+        "requirements_cancelled": "Le téléchargement des fichiers requis n'a pas été lancé.",
+        "installing": "Installation...",
+        "requirements_start": "Le téléchargement démarre : yt-dlp.exe, ffmpeg.exe et ffprobe.exe sont vérifiés/installés.",
+        "requirements_started_log": "Installation des téléchargements supplémentaires démarrée.",
+        "download_ytdlp_status": "Téléchargement de yt-dlp.exe...",
+        "download_ffmpeg_status": "Téléchargement du paquet FFmpeg...",
+        "install_crypto_status": "Installation de pycryptodome pour support MEGA...",
+        "installed": "Installé",
+        "already_present": "Déjà présent",
+        "all_present": "Tous les fichiers requis sont présents.",
+        "requirements_finished": "Téléchargements supplémentaires terminés.",
+        "requirements_error": "Erreur des téléchargements supplémentaires.",
+        "mp3_conversion_start": "Conversion en MP3...",
+        "mp3_conversion_done": "Conversion MP3 terminée",
+        "mp3_requires_ffmpeg": "La conversion MP3 nécessite FFmpeg. Installe FFmpeg ou clique sur Téléchargements supplémentaires.",
+        "mp3_output_enabled": "Sortie MP3 activée : l'audio sera extrait/converti si possible.",
+    },
+}
+for _lang, _values in TR_EXTRA.items():
+    TR.setdefault(_lang, {})
+    TR[_lang].update(_values)
+
+OPTION_TEXT = {
+    "mode": {
+        "auto": {"English": "Auto", "Deutsch": "Auto", "Spanish": "Auto", "Italian": "Auto", "French": "Auto"},
+        "direct": {"English": "Direct file link", "Deutsch": "Direkter Datei-Link", "Spanish": "Enlace directo", "Italian": "Link file diretto", "French": "Lien fichier direct"},
+        "ytdlp": {"English": "Website / yt-dlp", "Deutsch": "Webseite / yt-dlp", "Spanish": "Sitio web / yt-dlp", "Italian": "Sito web / yt-dlp", "French": "Site web / yt-dlp"},
+    },
+    "quality": {
+        "best": {"English": "Best video", "Deutsch": "Bestes Video", "Spanish": "Mejor video", "Italian": "Miglior video", "French": "Meilleure vidéo"},
+        "1080p": {"English": "1080p", "Deutsch": "1080p", "Spanish": "1080p", "Italian": "1080p", "French": "1080p"},
+        "720p": {"English": "720p", "Deutsch": "720p", "Spanish": "720p", "Italian": "720p", "French": "720p"},
+        "480p": {"English": "480p", "Deutsch": "480p", "Spanish": "480p", "Italian": "480p", "French": "480p"},
+        "audio_mp3": {"English": "Audio MP3 only", "Deutsch": "Nur Audio MP3", "Spanish": "Solo audio MP3", "Italian": "Solo audio MP3", "French": "Audio MP3 uniquement"},
+    },
+    "output": {
+        "mp4": {"English": "MP4", "Deutsch": "MP4", "Spanish": "MP4", "Italian": "MP4", "French": "MP4"},
+        "mkv": {"English": "MKV", "Deutsch": "MKV", "Spanish": "MKV", "Italian": "MKV", "French": "MKV"},
+        "webm": {"English": "WEBM", "Deutsch": "WEBM", "Spanish": "WEBM", "Italian": "WEBM", "French": "WEBM"},
+        "mp3": {"English": "MP3", "Deutsch": "MP3", "Spanish": "MP3", "Italian": "MP3", "French": "MP3"},
+    },
+    "speed": {
+        "gentle": {"English": "Gentle", "Deutsch": "Schonend", "Spanish": "Suave", "Italian": "Leggero", "French": "Doux"},
+        "normal": {"English": "Normal", "Deutsch": "Normal", "Spanish": "Normal", "Italian": "Normale", "French": "Normal"},
+        "fast": {"English": "Fast", "Deutsch": "Schnell", "Spanish": "Rápido", "Italian": "Veloce", "French": "Rapide"},
+    },
+}
+
+def tr(lang: str, key: str) -> str:
+    return TR.get(lang, TR["English"]).get(key, TR["English"].get(key, key))
+
+def option_label(group: str, key: str, lang: str) -> str:
+    data = OPTION_TEXT[group][key]
+    return data.get(lang, data.get("English", key))
+
+def option_values(group: str, lang: str) -> list[str]:
+    return [option_label(group, key, lang) for key in OPTION_TEXT[group]]
+
+def option_key(group: str, value: str, lang: str | None = None) -> str:
+    value = str(value or "").strip()
+    if not value:
+        return next(iter(OPTION_TEXT[group]))
+
+    for key, translations in OPTION_TEXT[group].items():
+        if value == key:
+            return key
+        for translated in translations.values():
+            if value.lower() == translated.lower():
+                return key
+
+    normalized = value.lower()
+    aliases = {
+        "mode": {
+            "auto": "auto",
+            "direkter datei-link": "direct",
+            "direct file link": "direct",
+            "webseite / yt-dlp": "ytdlp",
+            "website / yt-dlp": "ytdlp",
+        },
+        "quality": {
+            "bestes video": "best",
+            "best video": "best",
+            "nur audio mp3": "audio_mp3",
+            "audio mp3 only": "audio_mp3",
+        },
+        "speed": {
+            "schonend": "gentle",
+            "gentle": "gentle",
+            "schnell": "fast",
+            "fast": "fast",
+            "normal": "normal",
+        },
+        "output": {
+            "mp4": "mp4",
+            "mkv": "mkv",
+            "webm": "webm",
+            "mp3": "mp3",
+        },
+    }
+    return aliases.get(group, {}).get(normalized, next(iter(OPTION_TEXT[group])))
+
+
+def normalize_key(key: str) -> str:
+    raw = re.sub(r"[^A-Za-z0-9]", "", key or "").upper()
+    if len(raw) == 12:
+        return f"{raw[0:4]}-{raw[4:8]}-{raw[8:12]}"
+    return (key or "").strip().upper()
+
+
+def is_valid_key(key: str) -> tuple[bool, str]:
+    """
+    Online license check via Cloudflare Worker.
+    If online check succeeds, a 30-day offline cache is saved locally.
+    If internet/server is unavailable, the app can start with a valid offline cache.
+    """
+    normalized = normalize_key(key)
+    raw = re.sub(r"[^A-Za-z0-9]", "", normalized).upper()
+
+    if len(raw) != 12:
+        return False, "Invalid key format."
+
+    try:
+        response = requests.post(
+            LICENSE_API_URL,
+            json={"key": normalized},
+            timeout=12,
+            headers={"Content-Type": "application/json"},
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get("ok") is True and data.get("valid") is True:
+            save_offline_license(normalized)
+            return True, "Login successful. Offline access saved for 30 days."
+
+        return False, data.get("error") or "Invalid license key."
+
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+        offline_valid, offline_message = load_offline_license()
+        if offline_valid:
+            return True, offline_message
+        return False, "No connection to license server and no valid offline cache."
+
+    except Exception as exc:
+        offline_valid, offline_message = load_offline_license()
+        if offline_valid:
+            return True, offline_message
+        return False, f"License check failed: {exc}"
+
+
+
+
+def app_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def find_local_or_path_exe(name: str):
+    local = app_dir() / name
+    if local.exists():
+        return str(local)
+    found = shutil.which(name)
+    return found
+
+
+def find_ytdlp_exe():
+    candidates = [
+        "yt-dlp.exe",
+        "yt-dlp",
+        "yt_dlp.exe",
+    ]
+
+    for candidate in candidates:
+        found = find_local_or_path_exe(candidate)
+        if found:
+            return found
+
+    return None
+
+
+def safe_filename(name: str, fallback: str = "download") -> str:
+    name = unquote(name or "")
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return (name[:180] or fallback)
+
+
+def valid_url(url: str) -> bool:
+    return bool(re.match(r"^https?://", url.strip(), re.IGNORECASE))
+
+
+def is_direct_file_url(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return path.endswith(DIRECT_VIDEO_EXTENSIONS + DIRECT_AUDIO_EXTENSIONS)
+
+
+def filename_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    name = Path(unquote(parsed.path)).name
+    return safe_filename(name, "video_download")
+
+
+def seconds_to_text(sec):
+    if sec is None:
+        return "?"
+    try:
+        sec = int(sec)
+    except Exception:
+        return "?"
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+    i = 1
+    while True:
+        new = parent / f"{stem}_{i}{suffix}"
+        if not new.exists():
+            return new
+        i += 1
+
+
+def server_supports_ranges(url: str, headers: dict, timeout) -> bool:
+    try:
+        test_headers = dict(headers)
+        test_headers["Range"] = "bytes=0-0"
+        r = requests.get(url, headers=test_headers, timeout=timeout, stream=True, allow_redirects=True)
+        try:
+            return r.status_code == 206
+        finally:
+            r.close()
+    except Exception:
+        return False
+
+
+class CancelDownload(Exception):
+    pass
+
+
+
+
+class HoverInfo:
+    def __init__(self, widget, text_func, delay=350):
+        self.widget = widget
+        self.text_func = text_func
+        self.delay = delay
+        self.tip = None
+        self.after_id = None
+
+        self.widget.bind("<Enter>", self.on_enter, add="+")
+        self.widget.bind("<Leave>", self.on_leave, add="+")
+        self.widget.bind("<ButtonPress>", self.on_leave, add="+")
+        self.widget.bind("<Destroy>", self.on_leave, add="+")
+
+    def on_enter(self, _event=None):
+        self.cancel()
+        self.after_id = self.widget.after(self.delay, self.show)
+
+    def on_leave(self, _event=None):
+        self.cancel()
+        self.hide()
+
+    def cancel(self):
+        if self.after_id:
+            try:
+                self.widget.after_cancel(self.after_id)
+            except Exception:
+                pass
+            self.after_id = None
+
+    def show(self):
+        self.hide()
+        try:
+            message = self.text_func() if callable(self.text_func) else str(self.text_func)
+        except Exception:
+            message = ""
+        if not message:
+            return
+
+        self.tip = ctk.CTkToplevel(self.widget)
+        self.tip.overrideredirect(True)
+        self.tip.attributes("-topmost", True)
+        self.tip.configure(fg_color="#111116")
+
+        x = self.widget.winfo_rootx() + self.widget.winfo_width() + 10
+        y = self.widget.winfo_rooty() - 4
+        self.tip.geometry(f"+{x}+{y}")
+
+        frame = ctk.CTkFrame(
+            self.tip,
+            corner_radius=14,
+            fg_color="#111116",
+            border_width=1,
+            border_color=BORDER,
+        )
+        frame.pack(fill="both", expand=True)
+
+        label = ctk.CTkLabel(
+            frame,
+            text=message,
+            justify="left",
+            wraplength=340,
+            text_color="#f1f1f4",
+            fg_color="transparent",
+            font=ctk.CTkFont(size=12),
+            padx=12,
+            pady=10,
+        )
+        label.pack(fill="both", expand=True)
+
+    def hide(self):
+        if self.tip is not None:
+            try:
+                self.tip.destroy()
+            except Exception:
+                pass
+            self.tip = None
+
+
+
+class ToastNotification(ctk.CTkToplevel):
+    def __init__(self, master, title, message, kind="info", duration=3200, on_close=None, actions=None):
+        super().__init__(master)
+
+        self.master_window = master
+        self.title_text = title
+        self.message_text = message
+        self.kind = kind
+        self.duration = duration
+        self.on_close = on_close
+        self.actions = actions or []
+        self.hiding = False
+        self.visible = False
+
+        self.toast_width = 360
+        line_count = max(1, message.count("\n") + 1)
+        self.toast_height = 90 + min(2, line_count - 1) * 18
+
+        if kind == "error":
+            accent = RED
+            title_color = "#ffd9d9"
+            icon_text = "✕"
+        else:
+            accent = "#4ea1ff"
+            title_color = "#eaf3ff"
+            icon_text = "i"
+
+        self.withdraw()
+        self.overrideredirect(True)
+        self.resizable(False, False)
+        self.attributes("-topmost", True)
+        try:
+            self.attributes("-alpha", 0.0)
+        except Exception:
+            pass
+
+        self.configure(fg_color="#111116")
+
+        self.outer = ctk.CTkFrame(
+            self,
+            width=self.toast_width,
+            height=self.toast_height,
+            fg_color="#121219",
+            corner_radius=16,
+            border_width=1,
+            border_color=BORDER,
+        )
+        self.outer.pack(fill="both", expand=True)
+        self.outer.pack_propagate(False)
+
+        self.outer.grid_columnconfigure(0, weight=0)
+        self.outer.grid_columnconfigure(1, weight=1)
+        self.outer.grid_columnconfigure(2, weight=0)
+
+        self.accent_bar = ctk.CTkFrame(
+            self.outer,
+            width=6,
+            corner_radius=16,
+            fg_color=accent,
+        )
+        self.accent_bar.grid(row=0, column=0, sticky="nsw", padx=(0, 12), pady=0)
+
+        self.content = ctk.CTkFrame(self.outer, fg_color="transparent")
+        self.content.grid(row=0, column=1, sticky="nsew", padx=(0, 8), pady=10)
+
+        self.title_label = ctk.CTkLabel(
+            self.content,
+            text=f"{icon_text}  {self.title_text}",
+            anchor="w",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=title_color,
+        )
+        self.title_label.pack(anchor="w", pady=(0, 4))
+
+        self.message_label = ctk.CTkLabel(
+            self.content,
+            text=self.message_text,
+            anchor="w",
+            justify="left",
+            wraplength=270,
+            font=ctk.CTkFont(size=12),
+            text_color="#f1f1f4",
+        )
+        self.message_label.pack(anchor="w")
+
+        if self.actions:
+            self.actions_frame = ctk.CTkFrame(self.content, fg_color="transparent")
+            self.actions_frame.pack(anchor="w", pady=(9, 0))
+
+            for action_index, action in enumerate(self.actions):
+                label = action.get("text", "OK")
+                callback = action.get("command")
+                style = action.get("style", "secondary")
+
+                if style == "primary":
+                    fg = GREEN
+                    hover = GREEN_HOVER
+                    color = "#06130d"
+                else:
+                    fg = "#282834"
+                    hover = "#343445"
+                    color = "#f1f1f4"
+
+                btn = ctk.CTkButton(
+                    self.actions_frame,
+                    text=label,
+                    width=74,
+                    height=30,
+                    corner_radius=10,
+                    fg_color=fg,
+                    hover_color=hover,
+                    text_color=color,
+                    font=ctk.CTkFont(size=12, weight="bold"),
+                    command=lambda cb=callback: self.run_action(cb),
+                )
+                btn.grid(row=0, column=action_index, padx=(0, 8))
+
+        self.close_button = ctk.CTkButton(
+            self.outer,
+            text="✕",
+            width=26,
+            height=26,
+            corner_radius=13,
+            fg_color="#23232d",
+            hover_color="#2e2e3c",
+            text_color="#d8d8df",
+            command=self.hide,
+        )
+        self.close_button.grid(row=0, column=2, sticky="ne", padx=(0, 10), pady=10)
+
+        self.current_x = 0
+        self.current_y = 0
+        self.target_x = 0
+        self.target_y = 0
+
+        self.bind("<Button-1>", lambda _e: self.hide())
+        self.outer.bind("<Button-1>", lambda _e: self.hide())
+        self.content.bind("<Button-1>", lambda _e: self.hide())
+        self.title_label.bind("<Button-1>", lambda _e: self.hide())
+        self.message_label.bind("<Button-1>", lambda _e: self.hide())
+
+    def set_target(self, x, y):
+        self.target_x = int(x)
+        self.target_y = int(y)
+
+        if not self.visible:
+            self.current_x = self.target_x + 18
+            self.current_y = self.target_y + 28
+            self.geometry(f"{self.toast_width}x{self.toast_height}+{self.current_x}+{self.current_y}")
+        else:
+            self.current_x = self.target_x
+            self.current_y = self.target_y
+            self.geometry(f"{self.toast_width}x{self.toast_height}+{self.current_x}+{self.current_y}")
+
+    def show(self):
+        if self.visible:
+            return
+
+        self.visible = True
+        self.deiconify()
+        self.lift()
+        self._animate_in(step=0)
+
+    def _animate_in(self, step=0):
+        if self.hiding:
+            return
+
+        total_steps = 8
+        progress = min(1.0, (step + 1) / total_steps)
+        alpha = min(1.0, progress * 1.35)
+        new_y = int(self.target_y + (1.0 - progress) * 28)
+        new_x = int(self.target_x + (1.0 - progress) * 18)
+
+        try:
+            self.attributes("-alpha", alpha)
+        except Exception:
+            pass
+
+        self.geometry(f"{self.toast_width}x{self.toast_height}+{new_x}+{new_y}")
+
+        if step < total_steps - 1:
+            self.after(22, lambda: self._animate_in(step + 1))
+        else:
+            self.geometry(f"{self.toast_width}x{self.toast_height}+{self.target_x}+{self.target_y}")
+            self.after(self.duration, self.hide)
+
+    def hide(self):
+        if self.hiding:
+            return
+        self.hiding = True
+        self._animate_out(step=0)
+
+    def _animate_out(self, step=0):
+        total_steps = 7
+        progress = min(1.0, (step + 1) / total_steps)
+        alpha = max(0.0, 1.0 - progress * 1.35)
+        new_y = int(self.target_y - progress * 18)
+        new_x = int(self.target_x + progress * 10)
+
+        try:
+            self.attributes("-alpha", alpha)
+        except Exception:
+            pass
+
+        self.geometry(f"{self.toast_width}x{self.toast_height}+{new_x}+{new_y}")
+
+        if step < total_steps - 1:
+            self.after(24, lambda: self._animate_out(step + 1))
+        else:
+            try:
+                self.destroy()
+            except Exception:
+                pass
+            if callable(self.on_close):
+                try:
+                    self.on_close(self)
+                except Exception:
+                    pass
+
+
+
+class InAppToast(ctk.CTkFrame):
+    def __init__(self, master, title, message, kind="info", duration=3200, on_close=None, actions=None):
+        super().__init__(
+            master,
+            width=360,
+            height=132 if actions else 92,
+            corner_radius=16,
+            fg_color="#121219",
+            border_width=1,
+            border_color=BORDER,
+        )
+
+        self.toast_width = 360
+        self.actions = actions or []
+        self.toast_height = 132 if self.actions else 92
+        self.duration = duration
+        self.on_close = on_close
+        self.hiding = False
+        self.target_x = 0
+        self.target_y = 0
+        self.hide_start_x = 0
+        self.hide_start_y = 0
+
+        if kind == "error":
+            accent = RED
+            title_color = "#ffd9d9"
+            icon_text = "✕"
+        else:
+            accent = "#4ea1ff"
+            title_color = "#eaf3ff"
+            icon_text = "i"
+
+        self.grid_columnconfigure(0, weight=0)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_columnconfigure(2, weight=0)
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_propagate(False)
+
+        self.accent_bar = ctk.CTkFrame(self, width=6, corner_radius=16, fg_color=accent)
+        self.accent_bar.grid(row=0, column=0, sticky="nsw", padx=(0, 12), pady=0)
+
+        self.content = ctk.CTkFrame(self, fg_color="transparent")
+        self.content.grid(row=0, column=1, sticky="nsew", padx=(0, 8), pady=10)
+
+        self.title_label = ctk.CTkLabel(
+            self.content,
+            text=f"{icon_text}  {title}",
+            anchor="w",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=title_color,
+        )
+        self.title_label.pack(anchor="w", pady=(0, 4))
+
+        self.message_label = ctk.CTkLabel(
+            self.content,
+            text=str(message),
+            anchor="w",
+            justify="left",
+            wraplength=270,
+            font=ctk.CTkFont(size=12),
+            text_color="#f1f1f4",
+        )
+        self.message_label.pack(anchor="w")
+
+        self.close_button = ctk.CTkButton(
+            self,
+            text="✕",
+            width=26,
+            height=26,
+            corner_radius=13,
+            fg_color="#23232d",
+            hover_color="#2e2e3c",
+            text_color="#d8d8df",
+            command=self.hide,
+        )
+        self.close_button.grid(row=0, column=2, sticky="ne", padx=(0, 10), pady=10)
+
+        if not self.actions:
+            for widget in (self, self.accent_bar, self.content, self.title_label, self.message_label):
+                widget.bind("<Button-1>", lambda _e: self.hide(), add="+")
+
+    def run_action(self, callback):
+        if callable(callback):
+            try:
+                callback()
+            except Exception:
+                pass
+        self.hide()
+
+    def set_target(self, x, y, animated=False):
+        if self.hiding:
+            return
+
+        self.target_x = int(x)
+        self.target_y = int(y)
+
+        if not self.winfo_ismapped() or not animated:
+            self.place(x=self.target_x, y=self.target_y)
+        else:
+            self._move_to_target(0)
+
+    def show(self):
+        if self.winfo_ismapped():
+            return
+        self.place(x=self.target_x + 20, y=self.target_y + 30)
+        self.lift()
+        self._animate_in(0)
+
+    def _animate_in(self, step):
+        if self.hiding or not self.winfo_exists():
+            return
+
+        total = 8
+        progress = min(1.0, (step + 1) / total)
+        x = int(self.target_x + (1.0 - progress) * 20)
+        y = int(self.target_y + (1.0 - progress) * 30)
+        self.place(x=x, y=y)
+
+        if step < total - 1:
+            self.after(22, lambda: self._animate_in(step + 1))
+        else:
+            self.place(x=self.target_x, y=self.target_y)
+            self.after(self.duration, self.hide)
+
+    def _move_to_target(self, step):
+        if self.hiding or not self.winfo_exists():
+            return
+
+        if step == 0:
+            self.move_start_x = self.winfo_x()
+            self.move_start_y = self.winfo_y()
+
+        total = 5
+        progress = min(1.0, (step + 1) / total)
+        x = int(self.move_start_x + (self.target_x - self.move_start_x) * progress)
+        y = int(self.move_start_y + (self.target_y - self.move_start_y) * progress)
+        self.place(x=x, y=y)
+
+        if step < total - 1:
+            self.after(18, lambda: self._move_to_target(step + 1))
+        else:
+            self.place(x=self.target_x, y=self.target_y)
+
+    def hide(self):
+        if self.hiding:
+            return
+
+        self.hiding = True
+
+        try:
+            self.hide_start_x = self.winfo_x()
+            self.hide_start_y = self.winfo_y()
+        except Exception:
+            self.hide_start_x = self.target_x
+            self.hide_start_y = self.target_y
+
+        self._animate_out(0)
+
+    def _animate_out(self, step):
+        if not self.winfo_exists():
+            return
+
+        total = 8
+        progress = min(1.0, (step + 1) / total)
+
+        # Fixed start position prevents jitter while closing.
+        x = int(self.hide_start_x + progress * 10)
+        y = int(self.hide_start_y - progress * 26)
+
+        self.place(x=x, y=y)
+
+        if step < total - 1:
+            self.after(20, lambda: self._animate_out(step + 1))
+        else:
+            try:
+                self.place_forget()
+                self.destroy()
+            except Exception:
+                pass
+
+            if callable(self.on_close):
+                try:
+                    self.on_close(self)
+                except Exception:
+                    pass
+
+
+class LoginWindow(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
+
+        self.selected_language = "English"
+        self.authenticated = False
+
+        self.title(f"{APP_NAME} Login")
+        self.geometry("580x540")
+        self.resizable(False, False)
+        self.configure(fg_color=BG)
+
+        self.card = ctk.CTkFrame(
+            self,
+            corner_radius=28,
+            fg_color=CARD,
+            border_width=1,
+            border_color=BORDER,
+        )
+        self.card.pack(expand=True, fill="both", padx=34, pady=34)
+
+        self.logo = ctk.CTkLabel(
+            self.card,
+            text="✦ ClipVault",
+            font=ctk.CTkFont(size=30, weight="bold"),
+            text_color=TEXT,
+        )
+        self.logo.pack(pady=(34, 4))
+
+        self.login_connection_badge = ctk.CTkLabel(
+            self.card,
+            text="● Checking...",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#ffaa33",
+            fg_color="#17171d",
+            corner_radius=14,
+            padx=14,
+            pady=7,
+        )
+        self.login_connection_badge.pack(pady=(6, 4))
+
+        self.title_label = ctk.CTkLabel(
+            self.card,
+            text=TR[self.selected_language]["login_title"],
+            font=ctk.CTkFont(size=22, weight="bold"),
+            text_color=TEXT,
+        )
+        self.title_label.pack(pady=(12, 4))
+
+        self.subtitle_label = ctk.CTkLabel(
+            self.card,
+            text=TR[self.selected_language]["login_subtitle"],
+            font=ctk.CTkFont(size=13),
+            text_color=MUTED,
+        )
+        self.subtitle_label.pack(pady=(0, 18))
+
+        self.language_var = ctk.StringVar(value="English")
+        self.language_menu = ctk.CTkOptionMenu(
+            self.card,
+            values=LANGUAGES,
+            variable=self.language_var,
+            height=42,
+            corner_radius=14,
+            fg_color=INPUT,
+            button_color="#272735",
+            button_hover_color="#343446",
+            command=self.change_language,
+        )
+        self.language_menu.pack(fill="x", padx=42, pady=(0, 14))
+
+        self.key_frame = ctk.CTkFrame(self.card, fg_color="transparent")
+        self.key_frame.pack(fill="x", padx=42, pady=(8, 18))
+
+        self.key_entry = ctk.CTkEntry(
+            self.key_frame,
+            height=58,
+            corner_radius=18,
+            placeholder_text="",
+            fg_color=INPUT,
+            border_color="#30303c",
+            text_color=TEXT,
+            placeholder_text_color="#777784",
+            font=ctk.CTkFont(size=18, weight="bold"),
+            justify="center",
+        )
+        self.key_entry.pack(fill="x")
+
+        self.fake_placeholder = ctk.CTkLabel(
+            self.key_frame,
+            text="XXXX-XXXX-XXXX",
+            font=ctk.CTkFont(size=18, weight="bold"),
+            text_color="#777784",
+            fg_color=INPUT,
+        )
+        self.fake_placeholder.place(relx=0.5, rely=0.5, anchor="center")
+        self.fake_placeholder.bind("<Button-1>", lambda event: self.key_entry.focus_set())
+
+        self.key_entry.bind("<Return>", lambda event: self.try_login())
+        self.key_entry.bind("<KeyRelease>", self.format_key_live)
+        self.key_entry.bind("<FocusIn>", lambda event: self.update_fake_placeholder())
+        self.key_entry.bind("<FocusOut>", lambda event: self.update_fake_placeholder())
+
+        self.status_label = ctk.CTkLabel(
+            self.card,
+            text="",
+            font=ctk.CTkFont(size=13),
+            text_color=RED,
+        )
+        self.status_label.pack(pady=(0, 16))
+
+        self.login_button = ctk.CTkButton(
+            self.card,
+            text=TR[self.selected_language]["login_button"],
+            height=68,
+            corner_radius=20,
+            fg_color=GREEN,
+            hover_color=GREEN_HOVER,
+            text_color="#06130d",
+            font=ctk.CTkFont(size=20, weight="bold"),
+            command=self.try_login,
+        )
+        self.login_button.pack(fill="x", padx=30, pady=(0, 28))
+
+        self.footer = ctk.CTkLabel(
+            self.card,
+            text="",
+            font=ctk.CTkFont(size=12),
+            text_color="#777784",
+        )
+        self.footer.pack()
+
+        self.protocol("WM_DELETE_WINDOW", self.safe_close)
+        self.login_connection_running = False
+        self.login_connection_active = True
+        self.start_login_connection_monitor()
+        self.after(100, self.key_entry.focus_set)
+
+    def update_login_connection_badge(self, online: bool | None):
+        if online is True:
+            self.login_connection_badge.configure(text="● Online", text_color=GREEN)
+        elif online is False:
+            self.login_connection_badge.configure(text="● Offline", text_color=RED)
+        else:
+            self.login_connection_badge.configure(text="● Checking...", text_color="#ffaa33")
+
+    def start_login_connection_monitor(self):
+        self.update_login_connection_badge(None)
+        self.check_login_connection_async()
+
+    def check_login_connection_async(self):
+        if not getattr(self, "login_connection_active", False):
+            return
+
+        if self.login_connection_running:
+            self.after(10000, self.check_login_connection_async)
+            return
+
+        self.login_connection_running = True
+
+        def worker():
+            online = has_internet_connection()
+            try:
+                self.after(0, lambda: self.finish_login_connection_check(online))
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(10000, self.check_login_connection_async)
+
+    def finish_login_connection_check(self, online: bool):
+        self.login_connection_running = False
+        self.update_login_connection_badge(online)
+
+    def change_language(self, value):
+        self.selected_language = value
+        t = TR[self.selected_language]
+        self.title_label.configure(text=t["login_title"])
+        self.subtitle_label.configure(text=t["login_subtitle"])
+        self.update_fake_placeholder()
+        self.login_button.configure(text=t["login_button"])
+        self.status_label.configure(text="")
+
+    def update_fake_placeholder(self):
+        if self.key_entry.get().strip():
+            self.fake_placeholder.place_forget()
+        else:
+            self.fake_placeholder.place(relx=0.5, rely=0.5, anchor="center")
+
+    def format_key_live(self, event=None):
+        current = self.key_entry.get()
+        raw = re.sub(r"[^A-Za-z0-9]", "", current).upper()[:12]
+        groups = [raw[i:i + 4] for i in range(0, len(raw), 4)]
+        formatted = "-".join(groups)
+
+        if formatted != current:
+            self.key_entry.delete(0, "end")
+            self.key_entry.insert(0, formatted)
+            self.key_entry.icursor("end")
+
+        self.update_fake_placeholder()
+
+    def try_login(self):
+        key = self.key_entry.get().strip()
+
+        self.login_button.configure(state="disabled", text="Checking...")
+        self.status_label.configure(text="Checking license...", text_color="#ffaa33")
+        self.update()
+
+        valid, message = is_valid_key(key)
+
+        self.login_button.configure(state="normal", text=TR[self.selected_language]["login_button"])
+
+        if valid:
+            self.authenticated = True
+            self.selected_language = self.language_var.get()
+            self.status_label.configure(text=TR[self.selected_language]["login_success"], text_color=GREEN)
+            self.after(250, self.safe_close)
+        else:
+            self.status_label.configure(text=message or TR[self.selected_language]["login_error"], text_color=RED)
+            self.key_entry.focus_set()
+
+    def safe_close(self):
+        self.login_connection_active = False
+        try:
+            self.quit()
+        except Exception:
+            pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+
+
+class ClipVaultApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
+
+        self.title(f"{APP_NAME} {APP_VERSION}")
+        self.geometry("1220x760")
+        self.minsize(1080, 680)
+        self.configure(fg_color=BG)
+
+        self.q = queue.Queue()
+        self.is_downloading = False
+        self.cancel_requested = False
+        self.download_dir = str(Path.home() / "Downloads")
+        self.last_progress_log = 0
+        self.lang = "English"
+        self.internet_online = None
+        self.internet_check_running = False
+        self.toast_notifications = []
+        self.toast_max = 2
+        self.toast_notifications = []
+
+        self.ffmpeg_path = find_local_or_path_exe("ffmpeg.exe") or find_local_or_path_exe("ffmpeg")
+        self.ffprobe_path = find_local_or_path_exe("ffprobe.exe") or find_local_or_path_exe("ffprobe")
+        self.ytdlp_path = find_ytdlp_exe()
+
+        self.build_ui()
+        self.init_toast_system()
+        self.after(200, self.process_queue)
+
+    # ========================================================
+    # UI
+    # ========================================================
+    def build_ui(self):
+        self.grid_columnconfigure(0, weight=0)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        self.sidebar = ctk.CTkFrame(self, width=245, corner_radius=0, fg_color=SIDEBAR)
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
+        self.sidebar.grid_rowconfigure(12, weight=1)
+
+        self.logo = ctk.CTkLabel(
+            self.sidebar,
+            text="✦ ClipVault",
+            font=ctk.CTkFont(size=28, weight="bold"),
+            text_color=TEXT,
+        )
+        self.logo.grid(row=0, column=0, padx=24, pady=(28, 2), sticky="w")
+
+        self.version = ctk.CTkLabel(
+            self.sidebar,
+            text=APP_VERSION,
+            font=ctk.CTkFont(size=13),
+            text_color=MUTED,
+        )
+        self.version.grid(row=1, column=0, padx=27, pady=(0, 14), sticky="w")
+
+        self.lang_label = ctk.CTkLabel(
+            self.sidebar,
+            text=TR[self.lang]["language"],
+            text_color=MUTED,
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        self.lang_label.grid(row=2, column=0, padx=24, pady=(0, 6), sticky="w")
+
+        self.lang_var = ctk.StringVar(value=self.lang)
+        self.lang_menu = ctk.CTkOptionMenu(
+            self.sidebar,
+            values=LANGUAGES,
+            variable=self.lang_var,
+            height=38,
+            corner_radius=14,
+            fg_color=INPUT,
+            button_color="#272735",
+            button_hover_color="#343446",
+            command=self.change_app_language,
+        )
+        self.lang_menu.grid(row=3, column=0, padx=18, pady=(0, 16), sticky="ew")
+
+        self.btn_requirements = ctk.CTkButton(
+            self.sidebar,
+            text="⬇  " + tr(self.lang, "requirements"),
+            height=46,
+            corner_radius=15,
+            fg_color="transparent",
+            hover_color="#23232c",
+            anchor="w",
+            command=self.confirm_install_required_files,
+        )
+        self.btn_requirements.grid(row=4, column=0, padx=18, pady=6, sticky="ew")
+
+        self.btn_folder = ctk.CTkButton(
+            self.sidebar,
+            text="📁  " + TR[self.lang]["open_folder"],
+            height=46,
+            corner_radius=15,
+            fg_color="transparent",
+            hover_color="#23232c",
+            anchor="w",
+            command=self.open_folder,
+        )
+        self.btn_folder.grid(row=5, column=0, padx=18, pady=6, sticky="ew")
+
+        self.btn_check = ctk.CTkButton(
+            self.sidebar,
+            text="ℹ  " + TR[self.lang]["check_link"],
+            height=46,
+            corner_radius=15,
+            fg_color="transparent",
+            hover_color="#23232c",
+            anchor="w",
+            command=self.check_link,
+        )
+        self.btn_check.grid(row=6, column=0, padx=18, pady=6, sticky="ew")
+
+        ffmpeg_text = "FFmpeg: gefunden" if self.ffmpeg_path else "FFmpeg: fehlt"
+        ffmpeg_color = GREEN if self.ffmpeg_path else "#ffaa33"
+        self.ffmpeg_label = ctk.CTkLabel(
+            self.sidebar,
+            text=TR[self.lang]["ffmpeg_found"] if self.ffmpeg_path else TR[self.lang]["ffmpeg_missing"],
+            text_color=ffmpeg_color,
+            font=ctk.CTkFont(size=13, weight="bold"),
+        )
+        self.ffmpeg_label.grid(row=7, column=0, padx=25, pady=(18, 4), sticky="w")
+
+        self.ffprobe_label = ctk.CTkLabel(
+            self.sidebar,
+            text=TR[self.lang]["ffprobe_found"] if self.ffprobe_path else TR[self.lang]["ffprobe_missing"],
+            text_color=GREEN if self.ffprobe_path else "#ffaa33",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        )
+        self.ffprobe_label.grid(row=8, column=0, padx=25, pady=(0, 4), sticky="w")
+
+        self.ytdlp_label = ctk.CTkLabel(
+            self.sidebar,
+            text=tr(self.lang, "ytdlp_found") if self.ytdlp_path else tr(self.lang, "ytdlp_missing"),
+            text_color=GREEN if self.ytdlp_path else "#ffaa33",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        )
+        self.ytdlp_label.grid(row=9, column=0, padx=25, pady=(0, 4), sticky="w")
+
+        self.crypto_label = ctk.CTkLabel(
+            self.sidebar,
+            text=tr(self.lang, "mega_ready") if HAS_CRYPTO else tr(self.lang, "mega_crypto_missing"),
+            text_color=GREEN if HAS_CRYPTO else "#ffaa33",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        )
+        self.crypto_label.grid(row=10, column=0, padx=25, pady=(0, 8), sticky="w")
+
+        self.side_note = ctk.CTkTextbox(
+            self.sidebar,
+            width=200,
+            height=175,
+            corner_radius=18,
+            fg_color=INPUT,
+            text_color="#b8b8c4",
+            border_width=1,
+            border_color=BORDER,
+            wrap="word",
+        )
+        self.side_note.grid(row=11, column=0, padx=18, pady=(10, 24), sticky="sew")
+        self.side_note.insert(
+            "1.0",
+            TR[self.lang]["note"],
+        )
+        self.side_note.configure(state="disabled")
+
+        self.main = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        self.main.grid(row=0, column=1, sticky="nsew")
+        self.main.grid_columnconfigure(0, weight=1)
+        self.main.grid_rowconfigure(4, weight=1)
+
+        self.header = ctk.CTkFrame(self.main, fg_color="transparent")
+        self.header.grid(row=0, column=0, padx=34, pady=(28, 12), sticky="ew")
+        self.header.grid_columnconfigure(0, weight=1)
+        self.header.grid_columnconfigure(1, weight=0)
+
+        self.title_label = ctk.CTkLabel(
+            self.header,
+            text=TR[self.lang]["download_studio"],
+            font=ctk.CTkFont(size=36, weight="bold"),
+            text_color=TEXT,
+        )
+        self.title_label.grid(row=0, column=0, sticky="w")
+
+        self.subtitle = ctk.CTkLabel(
+            self.header,
+            text=TR[self.lang]["subtitle"],
+            font=ctk.CTkFont(size=14),
+            text_color=MUTED,
+        )
+        self.subtitle.grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+        self.connection_badge = ctk.CTkLabel(
+            self.header,
+            text="● Checking...",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="#ffaa33",
+            fg_color="#17171d",
+            corner_radius=14,
+            padx=14,
+            pady=8,
+        )
+        self.connection_badge.grid(row=0, column=1, rowspan=2, sticky="ne", padx=(16, 0), pady=(4, 0))
+
+        self.card = ctk.CTkFrame(
+            self.main,
+            corner_radius=26,
+            fg_color=CARD,
+            border_width=1,
+            border_color=BORDER,
+        )
+        self.card.grid(row=1, column=0, padx=34, pady=(8, 16), sticky="ew")
+        self.card.grid_columnconfigure(0, weight=1)
+
+        self.url_label = ctk.CTkLabel(
+            self.card,
+            text=TR[self.lang]["video_link"],
+            font=ctk.CTkFont(size=15, weight="bold"),
+            text_color=TEXT,
+        )
+        self.url_label.grid(row=0, column=0, padx=24, pady=(22, 7), sticky="w")
+
+        self.url_entry = ctk.CTkEntry(
+            self.card,
+            height=50,
+            corner_radius=17,
+            placeholder_text=TR[self.lang]["url_placeholder"],
+            fg_color=INPUT,
+            border_color="#30303c",
+            text_color=TEXT,
+            placeholder_text_color="#666672",
+            font=ctk.CTkFont(size=14),
+        )
+        self.url_entry.grid(row=1, column=0, padx=24, pady=(0, 18), sticky="ew")
+
+        self.options = ctk.CTkFrame(self.card, fg_color="transparent")
+        self.options.grid(row=2, column=0, padx=24, pady=(0, 18), sticky="ew")
+        self.options.grid_columnconfigure((0, 1, 2, 3), weight=1)
+
+        self.mode_var = ctk.StringVar(value=option_label("mode", "auto", self.lang))
+        self.quality_var = ctk.StringVar(value=option_label("quality", "best", self.lang))
+        self.output_var = ctk.StringVar(value=option_label("output", "mp4", self.lang))
+        self.speed_var = ctk.StringVar(value=option_label("speed", "normal", self.lang))
+
+        self.mode_label, self.mode_menu = self.add_menu(self.options, TR[self.lang]["mode"], self.mode_var, option_values("mode", self.lang), 0)
+        self.quality_label_widget, self.quality_menu_widget = self.add_menu(self.options, TR[self.lang]["quality"], self.quality_var, option_values("quality", self.lang), 1)
+        self.output_label_widget, self.output_menu_widget = self.add_menu(self.options, TR[self.lang]["output"], self.output_var, option_values("output", self.lang), 2)
+        self.speed_label_widget, self.speed_menu_widget = self.add_menu(self.options, TR[self.lang]["speed_profile"], self.speed_var, option_values("speed", self.lang), 3)
+
+        self.switch_frame = ctk.CTkFrame(self.card, fg_color="transparent")
+        self.switch_frame.grid(row=3, column=0, padx=24, pady=(0, 18), sticky="ew")
+        self.switch_frame.grid_columnconfigure(4, weight=1)
+
+        self.playlist_var = ctk.BooleanVar(value=False)
+        self.clean_names_var = ctk.BooleanVar(value=True)
+
+        self.playlist_switch = ctk.CTkSwitch(
+            self.switch_frame,
+            text=TR[self.lang]["playlist"],
+            variable=self.playlist_var,
+            progress_color=GREEN,
+            text_color="#c7c7d2",
+        )
+        self.playlist_switch.grid(row=0, column=0, padx=(0, 4), sticky="w")
+        self.playlist_info_icon = self.create_info_icon(self.switch_frame, 1, "playlist_info")
+
+        self.clean_switch = ctk.CTkSwitch(
+            self.switch_frame,
+            text=TR[self.lang]["clean_names"],
+            variable=self.clean_names_var,
+            progress_color=GREEN,
+            text_color="#c7c7d2",
+        )
+        self.clean_switch.grid(row=0, column=2, padx=(8, 4), sticky="w")
+        self.clean_info_icon = self.create_info_icon(self.switch_frame, 3, "clean_names_info")
+
+        self.folder_frame = ctk.CTkFrame(self.card, fg_color="transparent")
+        self.folder_frame.grid(row=4, column=0, padx=24, pady=(0, 22), sticky="ew")
+        self.folder_frame.grid_columnconfigure(0, weight=1)
+
+        self.folder_entry = ctk.CTkEntry(
+            self.folder_frame,
+            height=46,
+            corner_radius=15,
+            fg_color=INPUT,
+            border_color="#30303c",
+            text_color="#d7d7df",
+            font=ctk.CTkFont(size=13),
+        )
+        self.folder_entry.grid(row=0, column=0, sticky="ew", padx=(0, 12))
+        self.folder_entry.insert(0, self.download_dir)
+
+        self.folder_choose = ctk.CTkButton(
+            self.folder_frame,
+            text=TR[self.lang]["choose_folder"],
+            width=145,
+            height=46,
+            corner_radius=15,
+            fg_color="#282834",
+            hover_color="#343445",
+            command=self.choose_folder,
+        )
+        self.folder_choose.grid(row=0, column=1)
+
+        self.status_card = ctk.CTkFrame(
+            self.main,
+            corner_radius=22,
+            fg_color=CARD2,
+            border_width=1,
+            border_color=BORDER,
+        )
+        self.status_card.grid(row=2, column=0, padx=34, pady=(0, 16), sticky="ew")
+        self.status_card.grid_columnconfigure(0, weight=1)
+
+        self.status_label = ctk.CTkLabel(
+            self.status_card,
+            text=TR[self.lang]["ready"],
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="#e7e7ef",
+        )
+        self.status_label.grid(row=0, column=0, padx=20, pady=(16, 5), sticky="w")
+
+        self.progress = ctk.CTkProgressBar(
+            self.status_card,
+            height=14,
+            corner_radius=10,
+            fg_color="#252532",
+            progress_color=GREEN,
+        )
+        self.progress.grid(row=1, column=0, padx=20, pady=(0, 16), sticky="ew")
+        self.progress.set(0)
+
+        self.action_frame = ctk.CTkFrame(self.main, fg_color="transparent")
+        self.action_frame.grid(row=3, column=0, padx=34, pady=(0, 16), sticky="ew")
+        self.action_frame.grid_columnconfigure(0, weight=1)
+
+        self.check_button = ctk.CTkButton(
+            self.action_frame,
+            text=TR[self.lang]["check_link"],
+            width=150,
+            height=48,
+            corner_radius=16,
+            fg_color="#282834",
+            hover_color="#343445",
+            command=self.check_link,
+        )
+        self.check_button.grid(row=0, column=1, padx=(0, 12), sticky="e")
+
+        self.cancel_button = ctk.CTkButton(
+            self.action_frame,
+            text=TR[self.lang]["cancel"],
+            width=130,
+            height=48,
+            corner_radius=16,
+            fg_color=RED,
+            hover_color=RED_HOVER,
+            state="disabled",
+            command=self.cancel_download,
+        )
+        self.cancel_button.grid(row=0, column=2, padx=(0, 12), sticky="e")
+
+        self.start_button = ctk.CTkButton(
+            self.action_frame,
+            text=TR[self.lang]["start_download"],
+            width=190,
+            height=48,
+            corner_radius=16,
+            fg_color=GREEN,
+            hover_color=GREEN_HOVER,
+            text_color="#06130d",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            command=self.start_download,
+        )
+        self.start_button.grid(row=0, column=3, sticky="e")
+
+        self.log_box = ctk.CTkTextbox(
+            self.main,
+            corner_radius=24,
+            fg_color=CARD2,
+            border_width=1,
+            border_color=BORDER,
+            text_color="#d6d6de",
+            font=ctk.CTkFont(size=13),
+            wrap="word",
+        )
+        self.log_box.grid(row=4, column=0, padx=34, pady=(0, 30), sticky="nsew")
+
+        self.log(tr(self.lang, "app_started"))
+        self.log(tr(self.lang, "license_worker"))
+        self.log(tr(self.lang, "offline_login_hint"))
+        self.log(tr(self.lang, "supported_links_log"))
+        self.log(tr(self.lang, "turbo_log"))
+        if self.ffmpeg_path:
+            self.log(f"{tr(self.lang, 'ffmpeg_found_log')}: {self.ffmpeg_path}")
+        else:
+            self.log(tr(self.lang, "ffmpeg_missing_log"))
+
+        if self.ytdlp_path:
+            self.log(f"{tr(self.lang, 'ytdlp_found_log')}: {self.ytdlp_path}")
+        else:
+            self.log(tr(self.lang, "ytdlp_missing_log"))
+            self.after(600, lambda: self.show_toast(
+                tr(self.lang, "ytdlp_missing_toast_title"),
+                tr(self.lang, "ytdlp_missing_toast_message"),
+                kind="error",
+                duration=6500,
+            ))
+
+        if HAS_CRYPTO:
+            self.log(tr(self.lang, "mega_ready_log"))
+        else:
+            self.log(tr(self.lang, "mega_missing_log"))
+            self.after(900, lambda: self.show_toast(
+                tr(self.lang, "mega_missing_toast_title"),
+                tr(self.lang, "mega_missing_toast_message"),
+                kind="error",
+                duration=6500,
+            ))
+
+        self.start_connection_monitor()
+
+    def update_connection_badge(self, online: bool | None):
+        self.internet_online = online
+
+        if online is True:
+            self.connection_badge.configure(text="● Online", text_color=GREEN)
+        elif online is False:
+            self.connection_badge.configure(text="● Offline", text_color=RED)
+        else:
+            self.connection_badge.configure(text="● Checking...", text_color="#ffaa33")
+
+    def start_connection_monitor(self):
+        self.update_connection_badge(None)
+        self.check_connection_async()
+
+    def check_connection_async(self):
+        if self.internet_check_running:
+            self.after(10000, self.check_connection_async)
+            return
+
+        self.internet_check_running = True
+
+        def worker():
+            online = has_internet_connection()
+            self.q.put(("connection", online))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(10000, self.check_connection_async)
+
+    def current_tooltip_text(self, key: str) -> str:
+        return TR[self.lang].get(key, "")
+
+    def create_info_icon(self, parent, column, tooltip_key):
+        icon = ctk.CTkLabel(
+            parent,
+            text="ℹ",
+            width=22,
+            text_color="#7ea6ff",
+            fg_color="transparent",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            cursor="hand2",
+        )
+        icon.grid(row=0, column=column, padx=(6, 18), sticky="w")
+        HoverInfo(icon, lambda: self.current_tooltip_text(tooltip_key))
+        return icon
+
+
+    def show_confirm_toast(self, title, message, yes_callback, no_callback=None):
+        self.toast_notifications = [t for t in self.toast_notifications if t.winfo_exists() and not getattr(t, "hiding", False)]
+
+        while len(self.toast_notifications) >= self.toast_max:
+            old = self.toast_notifications.pop(0)
+            try:
+                old.on_close = None
+                old.place_forget()
+                old.destroy()
+            except Exception:
+                pass
+
+        toast = InAppToast(
+            self.main,
+            title=title,
+            message=message,
+            kind="info",
+            duration=15000,
+            on_close=self.remove_toast,
+            actions=[
+                {"text": tr(self.lang, "yes"), "style": "primary", "command": yes_callback},
+                {"text": tr(self.lang, "no"), "style": "secondary", "command": no_callback},
+            ],
+        )
+
+        self.toast_notifications.append(toast)
+        self.position_toasts(animated=False)
+        toast.show()
+
+
+    def init_toast_system(self):
+        self.bind("<Configure>", self.on_window_configure)
+
+    def on_window_configure(self, _event=None):
+        self.after(10, self.position_toasts)
+
+    def show_toast(self, title, message, kind="info", duration=3200):
+        message = str(message).strip()
+        if not message:
+            return
+
+        self.toast_notifications = [t for t in self.toast_notifications if t.winfo_exists() and not getattr(t, "hiding", False)]
+
+        # Hard limit: never more than 2 toast widgets.
+        while len(self.toast_notifications) >= self.toast_max:
+            old = self.toast_notifications.pop(0)
+            try:
+                old.on_close = None
+                old.place_forget()
+                old.destroy()
+            except Exception:
+                pass
+
+        toast = InAppToast(
+            self.main,
+            title=title,
+            message=message,
+            kind=kind,
+            duration=duration,
+            on_close=self.remove_toast,
+        )
+        self.toast_notifications.append(toast)
+        self.position_toasts(animated=False)
+        toast.show()
+
+    def remove_toast(self, toast):
+        if toast in self.toast_notifications:
+            self.toast_notifications.remove(toast)
+        self.position_toasts(animated=True)
+
+    def position_toasts(self, animated=False):
+        if not hasattr(self, "main") or not self.toast_notifications:
+            return
+
+        try:
+            self.main.update_idletasks()
+            width = self.main.winfo_width()
+            height = self.main.winfo_height()
+        except Exception:
+            return
+
+        margin_right = 18
+        margin_bottom = 18
+        gap = 12
+
+        self.toast_notifications = [t for t in self.toast_notifications if t.winfo_exists() and not getattr(t, "hiding", False)]
+        if len(self.toast_notifications) > self.toast_max:
+            for old in self.toast_notifications[:-self.toast_max]:
+                try:
+                    old.on_close = None
+                    old.destroy()
+                except Exception:
+                    pass
+            self.toast_notifications = self.toast_notifications[-self.toast_max:]
+
+        for index, toast in enumerate(reversed(self.toast_notifications)):
+            x = width - toast.toast_width - margin_right
+            y = height - margin_bottom - toast.toast_height - index * (toast.toast_height + gap)
+            x = max(10, x)
+            y = max(10, y)
+            toast.set_target(x, y, animated=animated)
+
+    def add_menu(self, parent, label, variable, values, column):
+        lbl = ctk.CTkLabel(parent, text=label, text_color="#bdbdc8")
+        lbl.grid(row=0, column=column, sticky="w", pady=(0, 6), padx=(0 if column == 0 else 14, 0))
+
+        menu = ctk.CTkOptionMenu(
+            parent,
+            values=values,
+            variable=variable,
+            height=42,
+            corner_radius=14,
+            fg_color=INPUT,
+            button_color="#272735",
+            button_hover_color="#343446",
+        )
+        menu.grid(row=1, column=column, sticky="ew", padx=(0 if column == 0 else 14, 0))
+        return lbl, menu
+
+    def change_app_language(self, value):
+        old_lang = getattr(self, "lang", "English")
+        old_mode = option_key("mode", self.mode_var.get(), old_lang)
+        old_quality = option_key("quality", self.quality_var.get(), old_lang)
+        old_output = option_key("output", self.output_var.get(), old_lang)
+        old_speed = option_key("speed", self.speed_var.get(), old_lang)
+
+        self.lang = value
+        t = TR[self.lang]
+
+        self.lang_label.configure(text=t["language"])
+        self.btn_requirements.configure(text="⬇  " + tr(self.lang, "requirements"))
+        self.btn_folder.configure(text="📁  " + t["open_folder"])
+        self.btn_check.configure(text="ℹ  " + t["check_link"])
+
+        self.ffmpeg_label.configure(text=t["ffmpeg_found"] if self.ffmpeg_path else t["ffmpeg_missing"])
+        self.ffprobe_label.configure(text=t["ffprobe_found"] if self.ffprobe_path else t["ffprobe_missing"])
+        self.ytdlp_label.configure(text=tr(self.lang, "ytdlp_found") if self.ytdlp_path else tr(self.lang, "ytdlp_missing"))
+        self.crypto_label.configure(text=tr(self.lang, "mega_ready") if HAS_CRYPTO else tr(self.lang, "mega_crypto_missing"))
+
+        self.side_note.configure(state="normal")
+        self.side_note.delete("1.0", "end")
+        self.side_note.insert("1.0", t["note"])
+        self.side_note.configure(state="disabled")
+
+        self.title_label.configure(text=t["download_studio"])
+        self.subtitle.configure(text=t["subtitle"])
+        self.url_label.configure(text=t["video_link"])
+        self.url_entry.configure(placeholder_text=t["url_placeholder"])
+
+        self.mode_label.configure(text=t["mode"])
+        self.quality_label_widget.configure(text=t["quality"])
+        self.output_label_widget.configure(text=t["output"])
+        self.speed_label_widget.configure(text=t["speed_profile"])
+
+        self.mode_menu.configure(values=option_values("mode", self.lang))
+        self.quality_menu_widget.configure(values=option_values("quality", self.lang))
+        self.output_menu_widget.configure(values=option_values("output", self.lang))
+        self.speed_menu_widget.configure(values=option_values("speed", self.lang))
+
+        self.mode_var.set(option_label("mode", old_mode, self.lang))
+        self.quality_var.set(option_label("quality", old_quality, self.lang))
+        self.output_var.set(option_label("output", old_output, self.lang))
+        self.speed_var.set(option_label("speed", old_speed, self.lang))
+
+        self.playlist_switch.configure(text=t["playlist"])
+        self.clean_switch.configure(text=t["clean_names"])
+        self.folder_choose.configure(text=t["choose_folder"])
+        self.check_button.configure(text=t["check_link"])
+        self.cancel_button.configure(text=t["cancel"])
+
+        if not self.is_downloading:
+            self.start_button.configure(text=t["start_download"])
+            self.status_label.configure(text=t["ready"])
+
+
+    def refresh_dependency_paths(self):
+        global AES, HAS_CRYPTO
+
+        try:
+            from Crypto.Cipher import AES as _AES
+            AES = _AES
+            HAS_CRYPTO = True
+        except Exception:
+            HAS_CRYPTO = False
+
+        self.ffmpeg_path = find_local_or_path_exe("ffmpeg.exe") or find_local_or_path_exe("ffmpeg")
+        self.ffprobe_path = find_local_or_path_exe("ffprobe.exe") or find_local_or_path_exe("ffprobe")
+        self.ytdlp_path = find_ytdlp_exe()
+
+        if hasattr(self, "ffmpeg_label"):
+            self.ffmpeg_label.configure(
+                text=TR[self.lang]["ffmpeg_found"] if self.ffmpeg_path else TR[self.lang]["ffmpeg_missing"],
+                text_color=GREEN if self.ffmpeg_path else "#ffaa33",
+            )
+
+        if hasattr(self, "ffprobe_label"):
+            self.ffprobe_label.configure(
+                text=TR[self.lang]["ffprobe_found"] if self.ffprobe_path else TR[self.lang]["ffprobe_missing"],
+                text_color=GREEN if self.ffprobe_path else "#ffaa33",
+            )
+
+        if hasattr(self, "ytdlp_label"):
+            self.ytdlp_label.configure(
+                text=tr(self.lang, "ytdlp_found") if self.ytdlp_path else tr(self.lang, "ytdlp_missing"),
+                text_color=GREEN if self.ytdlp_path else "#ffaa33",
+            )
+
+        if hasattr(self, "crypto_label"):
+            self.crypto_label.configure(
+                text=tr(self.lang, "mega_ready") if HAS_CRYPTO else tr(self.lang, "mega_crypto_missing"),
+                text_color=GREEN if HAS_CRYPTO else "#ffaa33",
+            )
+
+    def show_center_confirm_dialog(self, title, message, yes_callback, no_callback=None):
+        # Remove old center confirm if it exists
+        if hasattr(self, "center_confirm_frame") and self.center_confirm_frame is not None:
+            try:
+                self.center_confirm_frame.destroy()
+            except Exception:
+                pass
+            self.center_confirm_frame = None
+
+        self.main.update_idletasks()
+
+        overlay = ctk.CTkFrame(
+            self.main,
+            fg_color="#111118",
+            corner_radius=0,
+        )
+        overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        overlay.lift()
+
+        # Soft overlay instead of hard black. Tkinter/CustomTkinter has no reliable true blur,
+        # so this uses a very subtle dark glass-style layer.
+        soft_panel = ctk.CTkFrame(
+            overlay,
+            fg_color="#17171d",
+            corner_radius=0,
+        )
+        soft_panel.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+        card = ctk.CTkFrame(
+            overlay,
+            width=560,
+            height=360,
+            corner_radius=24,
+            fg_color="#15151b",
+            border_width=1,
+            border_color=BORDER,
+        )
+        card.place(relx=0.5, rely=0.5, anchor="center")
+        card.lift()
+        card.pack_propagate(False)
+        card.grid_columnconfigure(0, weight=1)
+
+        title_label = ctk.CTkLabel(
+            card,
+            text=title,
+            font=ctk.CTkFont(size=23, weight="bold"),
+            text_color=TEXT,
+        )
+        title_label.grid(row=0, column=0, padx=28, pady=(26, 8), sticky="w")
+
+        subtitle_label = ctk.CTkLabel(
+            card,
+            text=tr(self.lang, "requirements_question"),
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="#e7e7ef",
+            justify="left",
+        )
+        subtitle_label.grid(row=1, column=0, padx=28, pady=(0, 14), sticky="w")
+
+        info_box = ctk.CTkFrame(
+            card,
+            corner_radius=16,
+            fg_color="#101014",
+            border_width=1,
+            border_color="#272734",
+        )
+        info_box.grid(row=2, column=0, padx=28, pady=(0, 20), sticky="ew")
+        info_box.grid_columnconfigure(0, weight=1)
+
+        info_label = ctk.CTkLabel(
+            info_box,
+            text=message,
+            font=ctk.CTkFont(size=13),
+            text_color="#d6d6de",
+            justify="left",
+            wraplength=490,
+        )
+        info_label.grid(row=0, column=0, padx=16, pady=14, sticky="w")
+
+        button_frame = ctk.CTkFrame(card, fg_color="transparent")
+        button_frame.grid(row=3, column=0, padx=28, pady=(0, 24), sticky="ew")
+        button_frame.grid_columnconfigure(0, weight=1)
+
+        def close_dialog():
+            try:
+                overlay.destroy()
+            except Exception:
+                pass
+            self.center_confirm_frame = None
+
+        def yes_action():
+            close_dialog()
+            if callable(yes_callback):
+                yes_callback()
+
+        def no_action():
+            close_dialog()
+            if callable(no_callback):
+                no_callback()
+
+        no_button = ctk.CTkButton(
+            button_frame,
+            text=tr(self.lang, "no"),
+            width=120,
+            height=42,
+            corner_radius=14,
+            fg_color="#282834",
+            hover_color="#343445",
+            text_color="#f1f1f4",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            command=no_action,
+        )
+        no_button.grid(row=0, column=1, padx=(0, 12), sticky="e")
+
+        yes_button = ctk.CTkButton(
+            button_frame,
+            text=tr(self.lang, "yes"),
+            width=150,
+            height=42,
+            corner_radius=14,
+            fg_color=GREEN,
+            hover_color=GREEN_HOVER,
+            text_color="#06130d",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            command=yes_action,
+        )
+        yes_button.grid(row=0, column=2, sticky="e")
+
+        close_button = ctk.CTkButton(
+            card,
+            text="✕",
+            width=32,
+            height=32,
+            corner_radius=16,
+            fg_color="#23232d",
+            hover_color="#2e2e3c",
+            text_color="#d8d8df",
+            command=no_action,
+        )
+        close_button.place(relx=1.0, x=-18, y=18, anchor="ne")
+
+        self.center_confirm_frame = overlay
+
+    def confirm_install_required_files(self):
+        if getattr(self, "requirements_install_running", False):
+            self.show_toast(tr(self.lang, "wait_title"), tr(self.lang, "already_downloading"), kind="info")
+            return
+
+        self.show_center_confirm_dialog(
+            tr(self.lang, "requirements"),
+            tr(self.lang, "requirements_desc"),
+            yes_callback=self.install_required_files,
+            no_callback=lambda: self.show_toast(tr(self.lang, "cancelled"), tr(self.lang, "requirements_cancelled"), kind="info"),
+        )
+
+    def install_required_files(self):
+        if getattr(self, "requirements_install_running", False):
+            self.show_toast(tr(self.lang, "wait_title"), tr(self.lang, "already_downloading"), kind="info")
+            return
+
+        self.requirements_install_running = True
+        self.btn_requirements.configure(state="disabled", text="⬇  " + tr(self.lang, "installing"))
+        self.show_toast(
+            tr(self.lang, "requirements"),
+            tr(self.lang, "requirements_start"),
+            kind="info",
+            duration=3600,
+        )
+        self.log(tr(self.lang, "requirements_started_log"))
+
+        threading.Thread(target=self.install_required_files_worker, daemon=True).start()
+
+    def install_required_files_worker(self):
+        try:
+            installed = []
+            skipped = []
+
+            tool_dir = app_dir()
+
+            ytdlp_target = tool_dir / "yt-dlp.exe"
+            if not ytdlp_target.exists():
+                self.q.put(("status", tr(self.lang, "download_ytdlp_status")))
+                self.download_file(YTDLP_EXE_URL, ytdlp_target, "yt-dlp.exe")
+                installed.append("yt-dlp.exe")
+            else:
+                skipped.append("yt-dlp.exe")
+
+            ffmpeg_target = tool_dir / "ffmpeg.exe"
+            ffprobe_target = tool_dir / "ffprobe.exe"
+
+            if not ffmpeg_target.exists() or not ffprobe_target.exists():
+                self.q.put(("status", tr(self.lang, "download_ffmpeg_status")))
+                zip_path = tool_dir / "_ffmpeg_download.zip"
+                self.download_file(FFMPEG_ZIP_URL, zip_path, "FFmpeg Paket")
+                self.extract_ffmpeg_binaries(zip_path, tool_dir)
+
+                try:
+                    zip_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+                if ffmpeg_target.exists():
+                    installed.append("ffmpeg.exe")
+                if ffprobe_target.exists():
+                    installed.append("ffprobe.exe")
+            else:
+                skipped.extend(["ffmpeg.exe", "ffprobe.exe"])
+
+            if not HAS_CRYPTO:
+                self.q.put(("status", tr(self.lang, "install_crypto_status")))
+                self.install_python_package("pycryptodome", "pycryptodome")
+                installed.append("pycryptodome")
+            else:
+                skipped.append("pycryptodome")
+
+            self.q.put(("refresh_deps", None))
+
+            msg_parts = []
+            if installed:
+                msg_parts.append(tr(self.lang, "installed") + ": " + ", ".join(installed))
+            if skipped:
+                msg_parts.append(tr(self.lang, "already_present") + ": " + ", ".join(skipped))
+
+            final_msg = "\n".join(msg_parts) if msg_parts else tr(self.lang, "all_present")
+            self.q.put(("info", final_msg))
+            self.q.put(("log", tr(self.lang, "requirements_finished") + " " + final_msg.replace("\n", " | ")))
+            self.q.put(("status", tr(self.lang, "requirements_finished")))
+
+        except Exception as e:
+            self.q.put(("error", f"{tr(self.lang, 'requirements_error')} {e}"))
+            self.q.put(("log", f"{tr(self.lang, 'requirements_error')} {e}"))
+            self.q.put(("status", tr(self.lang, "requirements_error")))
+        finally:
+            self.q.put(("requirements_done", None))
+
+    def install_python_package(self, package_name: str, label: str):
+        cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            package_name,
+        ]
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+
+        try:
+            for line in process.stdout:
+                line = line.strip()
+                if line:
+                    self.q.put(("status", f"{label}: {line[:120]}"))
+                    if "error" in line.lower() or "failed" in line.lower():
+                        self.q.put(("log", f"{label}: {line[:400]}"))
+
+            return_code = process.wait()
+            if return_code != 0:
+                raise RuntimeError(f"{label} Installation fehlgeschlagen. Exit-Code: {return_code}")
+
+        finally:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+            except Exception:
+                pass
+
+    def download_file(self, url: str, target: Path, label: str):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temp_target = target.with_suffix(target.suffix + ".part")
+
+        headers = {"User-Agent": "Mozilla/5.0"}
+        with requests.get(url, stream=True, timeout=(30, 300), headers=headers, allow_redirects=True) as r:
+            r.raise_for_status()
+            total = int(r.headers.get("content-length", 0) or 0)
+            downloaded = 0
+            start_time = time.time()
+
+            with open(temp_target, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024 * 4):
+                    if not chunk:
+                        continue
+
+                    f.write(chunk)
+                    downloaded += len(chunk)
+
+                    elapsed = max(time.time() - start_time, 0.1)
+                    speed = downloaded / elapsed / 1024 / 1024
+                    percent = downloaded / total if total else 0
+
+                    if total:
+                        self.q.put(("status", f"{label}: {percent * 100:.1f}% | {speed:.2f} MB/s"))
+                    else:
+                        self.q.put(("status", f"{label}: {downloaded / 1024 / 1024:.2f} MB | {speed:.2f} MB/s"))
+
+            if target.exists():
+                target.unlink()
+
+            temp_target.replace(target)
+
+    def extract_ffmpeg_binaries(self, zip_path: Path, tool_dir: Path):
+        found_ffmpeg = False
+        found_ffprobe = False
+
+        with zipfile.ZipFile(zip_path, "r") as z:
+            names = z.namelist()
+
+            ffmpeg_name = next((n for n in names if n.lower().endswith("/bin/ffmpeg.exe")), None)
+            ffprobe_name = next((n for n in names if n.lower().endswith("/bin/ffprobe.exe")), None)
+
+            if not ffmpeg_name or not ffprobe_name:
+                # fallback if zip structure changes
+                ffmpeg_name = next((n for n in names if n.lower().endswith("ffmpeg.exe")), ffmpeg_name)
+                ffprobe_name = next((n for n in names if n.lower().endswith("ffprobe.exe")), ffprobe_name)
+
+            if ffmpeg_name:
+                with z.open(ffmpeg_name) as src, open(tool_dir / "ffmpeg.exe", "wb") as dst:
+                    shutil.copyfileobj(src, dst, length=1024 * 1024 * 8)
+                found_ffmpeg = True
+
+            if ffprobe_name:
+                with z.open(ffprobe_name) as src, open(tool_dir / "ffprobe.exe", "wb") as dst:
+                    shutil.copyfileobj(src, dst, length=1024 * 1024 * 8)
+                found_ffprobe = True
+
+        if not found_ffmpeg or not found_ffprobe:
+            raise RuntimeError("ffmpeg.exe oder ffprobe.exe wurde im ZIP nicht gefunden.")
+
+    # ========================================================
+    # Basic UI actions
+    # ========================================================
+    def log(self, text: str):
+        self.log_box.insert("end", f"[{time.strftime('%H:%M:%S')}] {text}\n")
+        self.log_box.see("end")
+
+    def set_status(self, text: str):
+        self.status_label.configure(text=text)
+
+    def choose_folder(self):
+        folder = filedialog.askdirectory(initialdir=self.download_dir)
+        if folder:
+            self.download_dir = folder
+            self.folder_entry.delete(0, "end")
+            self.folder_entry.insert(0, folder)
+
+    def open_folder(self):
+        folder = self.folder_entry.get().strip() or self.download_dir
+        Path(folder).mkdir(parents=True, exist_ok=True)
+        try:
+            webbrowser.open(Path(folder).resolve().as_uri())
+        except Exception:
+            os.startfile(folder)
+
+    def set_downloading_ui(self, downloading: bool):
+        self.is_downloading = downloading
+        if downloading:
+            self.cancel_requested = False
+            self.start_button.configure(text=tr(self.lang, "running"), state="disabled")
+            self.cancel_button.configure(state="normal")
+            self.check_button.configure(state="disabled")
+            self.progress.set(0)
+        else:
+            self.cancel_requested = False
+            self.start_button.configure(text=TR[self.lang]["start_download"], state="normal")
+            self.cancel_button.configure(state="disabled")
+            self.check_button.configure(state="normal")
+
+    def cancel_download(self):
+        if self.is_downloading:
+            self.cancel_requested = True
+            self.set_status(tr(self.lang, "cancel_requested"))
+            self.log(tr(self.lang, "cancel_requested"))
+
+    # ========================================================
+    # Settings
+    # ========================================================
+    def speed_settings(self):
+        profile = option_key("speed", self.speed_var.get(), self.lang)
+        if profile == "gentle":
+            return {
+                "direct_chunk": 1024 * 1024,
+                "yt_fragments": 4,
+                "timeout": (60, 180),
+                "direct_threads": 2,
+                "mega_chunk": 1024 * 1024 * 2,
+            }
+        if profile == "fast":
+            return {
+                "direct_chunk": 1024 * 1024 * 8,
+                "yt_fragments": 16,
+                "timeout": (90, 300),
+                "direct_threads": 8,
+                "mega_chunk": 1024 * 1024 * 16,
+            }
+        return {
+            "direct_chunk": 1024 * 1024 * 4,
+            "yt_fragments": 10,
+            "timeout": (60, 300),
+            "direct_threads": 4,
+            "mega_chunk": 1024 * 1024 * 8,
+        }
+
+    def wants_mp3_output(self) -> bool:
+        quality_key = option_key("quality", self.quality_var.get(), self.lang)
+        output_key = option_key("output", self.output_var.get(), self.lang)
+        return quality_key == "audio_mp3" or output_key == "mp3"
+
+    def ensure_ffmpeg_for_mp3(self):
+        if not self.ffmpeg_path:
+            raise RuntimeError(tr(self.lang, "mp3_requires_ffmpeg"))
+
+    def convert_to_mp3(self, source_path: Path, final_path: Path | None = None) -> Path:
+        self.ensure_ffmpeg_for_mp3()
+        source_path = Path(source_path)
+        if final_path is None:
+            final_path = unique_path(source_path.with_suffix(".mp3"))
+        else:
+            final_path = unique_path(Path(final_path))
+
+        if source_path.suffix.lower() == ".mp3":
+            if source_path.resolve() != final_path.resolve():
+                shutil.move(str(source_path), str(final_path))
+            return final_path
+
+        self.q.put(("status", tr(self.lang, "mp3_conversion_start")))
+        self.q.put(("log", f"{tr(self.lang, 'mp3_conversion_start')} {source_path.name}"))
+
+        cmd = [
+            self.ffmpeg_path,
+            "-y",
+            "-i", str(source_path),
+            "-vn",
+            "-map", "0:a:0?",
+            "-codec:a", "libmp3lame",
+            "-b:a", "192k",
+            str(final_path),
+        ]
+        result = subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if result.returncode != 0 or not final_path.exists() or final_path.stat().st_size == 0:
+            final_path.unlink(missing_ok=True)
+            err = (result.stderr or result.stdout or "FFmpeg failed").strip()
+            raise RuntimeError(err[-900:])
+
+        try:
+            source_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        self.q.put(("log", f"{tr(self.lang, 'mp3_conversion_done')}: {final_path}"))
+        self.q.put(("status", tr(self.lang, "mp3_conversion_done")))
+        return final_path
+
+    def ytdlp_format(self):
+        q = option_key("quality", self.quality_var.get(), self.lang)
+        out_ext = option_key("output", self.output_var.get(), self.lang)
+
+        if q == "audio_mp3" or out_ext == "mp3":
+            return "bestaudio/best"
+        if q == "1080p":
+            return "bv*[height<=1080]+ba/b[height<=1080]/best[height<=1080]"
+        if q == "720p":
+            return "bv*[height<=720]+ba/b[height<=720]/best[height<=720]"
+        if q == "480p":
+            return "bv*[height<=480]+ba/b[height<=480]/best[height<=480]"
+        return "bv*+ba/best"
+
+    # ========================================================
+    # Link check
+    # ========================================================
+    def check_link(self):
+        url = self.url_entry.get().strip()
+        if not valid_url(url):
+            self.show_toast(tr(self.lang, "invalid_link_title"), tr(self.lang, "invalid_link_message"), kind="error")
+            return
+        if self.is_downloading:
+            return
+
+        self.check_button.configure(state="disabled")
+        self.set_status(tr(self.lang, "checking_link"))
+        self.log(f"{tr(self.lang, 'checking_link')} {url}")
+
+        threading.Thread(target=self.check_worker, args=(url,), daemon=True).start()
+
+    def check_worker(self, url):
+        try:
+            mode = option_key("mode", self.mode_var.get(), self.lang)
+            if is_mega_url(url) or is_mega_folder_url(url):
+                self.check_mega(url)
+            elif mode == "direct" or (mode == "auto" and is_direct_file_url(url)):
+                self.check_direct(url)
+            else:
+                self.check_ytdlp(url)
+        except Exception as e:
+            self.q.put(("log", f"{tr(self.lang, 'check_failed')} {e}"))
+            self.q.put(("status", tr(self.lang, "check_failed")))
+        finally:
+            self.q.put(("enable_check", None))
+
+    def check_direct(self, url):
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "*/*",
+            "Connection": "keep-alive",
+        }
+        timeout = self.speed_settings()["timeout"]
+
+        try:
+            r = requests.head(url, allow_redirects=True, timeout=timeout, headers=headers)
+            final_url = r.url or url
+            headers_info = r.headers
+        except Exception as e:
+            self.q.put(("log", f"HEAD failed, using GET fallback: {e}"))
+            with requests.get(url, stream=True, timeout=timeout, headers=headers, allow_redirects=True) as r:
+                r.raise_for_status()
+                final_url = r.url or url
+                headers_info = r.headers
+
+        size = headers_info.get("content-length")
+        ctype = headers_info.get("content-type", "?")
+        name = filename_from_url(final_url)
+
+        size_text = tr(self.lang, "unknown_size")
+        if size and str(size).isdigit():
+            size_text = f"{int(size) / 1024 / 1024:.2f} MB"
+
+        self.q.put(("log", f"{tr(self.lang, 'direct_check_ok')} {name}"))
+        self.q.put(("log", f"Typ: {ctype} | {tr(self.lang, 'mega_size')}: {size_text}"))
+        self.q.put(("status", tr(self.lang, "direct_check_ok")))
+
+    def check_mega(self, url):
+        if is_mega_folder_url(url):
+            self.q.put(("log", tr(self.lang, "mega_folder_unsupported")))
+            self.q.put(("status", tr(self.lang, "mega_folder_status")))
+            return
+
+        if not HAS_CRYPTO:
+            self.q.put(("log", tr(self.lang, "mega_missing_status")))
+            self.q.put(("status", tr(self.lang, "mega_missing_status")))
+            self.q.put(("error", "pycryptodome missing. Install with: pip install pycryptodome"))
+            return
+
+        file_id, file_key_string = parse_mega_file_url(url)
+        if not file_id or not file_key_string:
+            self.q.put(("log", tr(self.lang, "mega_invalid")))
+            self.q.put(("status", tr(self.lang, "mega_invalid_status")))
+            return
+
+        file_key, _nonce = mega_file_key_and_nonce(file_key_string)
+
+        api_url = "https://g.api.mega.co.nz/cs"
+        payload = [{"a": "g", "g": 1, "p": file_id}]
+        response = requests.post(api_url, params={"id": int(time.time() * 1000) % 1000000}, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()[0]
+
+        if isinstance(data, int):
+            raise RuntimeError(f"MEGA API error: {data}")
+
+        size = int(data.get("s", 0) or 0)
+        attrs = mega_decrypt_attributes(data.get("at", ""), file_key)
+        name = attrs.get("n", "mega_download.bin")
+
+        self.q.put(("log", f"{tr(self.lang, 'mega_file_detected')}: {name}"))
+        if size:
+            self.q.put(("log", f"{tr(self.lang, 'mega_size')}: {size / 1024 / 1024:.2f} MB"))
+        self.q.put(("status", tr(self.lang, "mega_status_ok")))
+
+    def check_ytdlp(self, url):
+        if not self.ytdlp_path:
+            self.q.put(("log", tr(self.lang, "ytdlp_missing_long")))
+            self.q.put(("status", tr(self.lang, "ytdlp_missing")))
+            return
+
+        cmd = [
+            self.ytdlp_path,
+            "--dump-single-json",
+            "--no-warnings",
+            "--socket-timeout", "60",
+        ]
+
+        if not self.playlist_var.get():
+            cmd.append("--no-playlist")
+
+        cmd.append(url)
+
+        result = subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=90,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip()
+            self.q.put(("log", f"{tr(self.lang, 'ytdlp_info_error')}: {err[:600]}"))
+            self.q.put(("status", tr(self.lang, "check_failed")))
+            return
+
+        try:
+            info = json.loads(result.stdout)
+        except Exception:
+            self.q.put(("log", "yt-dlp returned invalid JSON."))
+            self.q.put(("status", tr(self.lang, "link_check_no_info")))
+            return
+
+        if isinstance(info, dict) and "entries" in info:
+            entries = [e for e in info.get("entries", []) if e]
+            self.q.put(("log", f"{tr(self.lang, 'playlist_detected')}: {info.get('title', 'Untitled')}"))
+            self.q.put(("log", f"{tr(self.lang, 'entries')}: {len(entries)}"))
+            self.q.put(("status", f"{tr(self.lang, 'playlist_detected')}: {len(entries)}"))
+            return
+
+        title = info.get("title", "Untitled") if isinstance(info, dict) else "Unknown"
+        duration = seconds_to_text(info.get("duration")) if isinstance(info, dict) else "?"
+        uploader = (info.get("uploader") or info.get("channel") or "?") if isinstance(info, dict) else "?"
+
+        self.q.put(("log", f"{tr(self.lang, 'title')}: {title}"))
+        self.q.put(("log", f"{tr(self.lang, 'duration')}: {duration} | {tr(self.lang, 'uploader')}: {uploader}"))
+        self.q.put(("status", tr(self.lang, "link_detected")))
+
+    # ========================================================
+    # Download
+    # ========================================================
+    def start_download(self):
+        url = self.url_entry.get().strip()
+        if not valid_url(url):
+            self.show_toast(tr(self.lang, "invalid_link_title"), tr(self.lang, "invalid_link_message"), kind="error")
+            return
+
+        folder = self.folder_entry.get().strip() or self.download_dir
+        Path(folder).mkdir(parents=True, exist_ok=True)
+
+        self.set_downloading_ui(True)
+        self.set_status(tr(self.lang, "download_starting"))
+        self.log(f"{tr(self.lang, 'download_starting')} {url}")
+
+        threading.Thread(target=self.download_worker, args=(url, folder), daemon=True).start()
+
+    def download_worker(self, url, folder):
+        try:
+            mode = option_key("mode", self.mode_var.get(), self.lang)
+
+            if is_mega_url(url) or is_mega_folder_url(url):
+                self.download_mega(url, folder)
+            elif mode == "direct":
+                self.download_direct(url, folder)
+            elif mode == "ytdlp":
+                self.download_ytdlp(url, folder)
+            else:
+                if is_direct_file_url(url):
+                    self.download_direct(url, folder)
+                else:
+                    self.download_ytdlp(url, folder)
+
+            if self.cancel_requested:
+                raise CancelDownload(tr(self.lang, "cancelled"))
+
+            self.q.put(("progress", 1))
+            self.q.put(("status", tr(self.lang, "finished")))
+            self.q.put(("log", tr(self.lang, "download_done")))
+            self.q.put(("info", tr(self.lang, "download_done")))
+
+        except CancelDownload as e:
+            self.q.put(("status", tr(self.lang, "cancelled")))
+            self.q.put(("log", str(e)))
+
+        except Exception as e:
+            self.q.put(("status", tr(self.lang, "error")))
+            self.q.put(("log", f"{tr(self.lang, 'error')}: {e}"))
+            self.q.put(("error", str(e)))
+
+        finally:
+            self.q.put(("done", None))
+
+    def download_mega(self, url, folder):
+        if is_mega_folder_url(url):
+            raise RuntimeError(tr(self.lang, "mega_folder_unsupported"))
+
+        if not HAS_CRYPTO:
+            raise RuntimeError("pycryptodome missing. Install with: pip install pycryptodome")
+
+        file_id, file_key_string = parse_mega_file_url(url)
+        if not file_id or not file_key_string:
+            raise RuntimeError(tr(self.lang, "mega_invalid"))
+
+        file_key, nonce = mega_file_key_and_nonce(file_key_string)
+
+        api_url = "https://g.api.mega.co.nz/cs"
+        payload = [{"a": "g", "g": 1, "p": file_id}]
+        response = requests.post(api_url, params={"id": int(time.time() * 1000) % 1000000}, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()[0]
+
+        if isinstance(data, int):
+            raise RuntimeError(f"MEGA API error: {data}")
+
+        download_url = data.get("g")
+        if not download_url:
+            raise RuntimeError("MEGA download URL could not be fetched.")
+
+        size = int(data.get("s", 0) or 0)
+        attrs = mega_decrypt_attributes(data.get("at", ""), file_key)
+        name = safe_filename(attrs.get("n", "mega_download.bin"), "mega_download.bin")
+        mp3_requested = self.wants_mp3_output()
+        if mp3_requested:
+            self.ensure_ffmpeg_for_mp3()
+            self.q.put(("log", tr(self.lang, "mp3_output_enabled")))
+            raw_suffix = Path(name).suffix or ".bin"
+            download_output = unique_path(Path(folder) / (Path(name).stem + ".clipvault_tmp" + raw_suffix))
+            final_mp3_output = Path(folder) / (safe_filename(Path(name).stem, "mega_download") + ".mp3")
+        else:
+            download_output = unique_path(Path(folder) / name)
+            final_mp3_output = None
+        output = download_output
+
+        self.q.put(("status", tr(self.lang, "mega_running")))
+        self.q.put(("log", f"{tr(self.lang, 'saving_as')}: {output.name}"))
+
+        cipher = AES.new(file_key, AES.MODE_CTR, nonce=nonce, initial_value=0)
+
+        settings = self.speed_settings()
+        mega_chunk = settings.get("mega_chunk", 1024 * 1024 * 8)
+
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "*/*",
+            "Connection": "keep-alive",
+        }
+
+        self.q.put(("log", f"{tr(self.lang, 'mega_speed_profile')}: {self.speed_var.get()} | Chunk: {mega_chunk // 1024 // 1024} MB"))
+
+        session = requests.Session()
+        with session.get(download_url, stream=True, timeout=settings.get("timeout", (30, 300)), headers=headers, allow_redirects=True) as r:
+            r.raise_for_status()
+
+            downloaded = 0
+            start_time = time.time()
+
+            with open(output, "wb", buffering=1024 * 1024 * 8) as f:
+                for chunk in r.iter_content(chunk_size=mega_chunk):
+                    if self.cancel_requested:
+                        try:
+                            f.close()
+                            output.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        raise CancelDownload(tr(self.lang, "cancelled"))
+
+                    if not chunk:
+                        continue
+
+                    decrypted = cipher.decrypt(chunk)
+                    f.write(decrypted)
+                    downloaded += len(chunk)
+
+                    elapsed = max(time.time() - start_time, 0.1)
+                    speed = downloaded / elapsed
+                    percent = downloaded / size if size else 0
+                    eta = (size - downloaded) / speed if size and speed else None
+
+                    self.q.put(("progress", max(0, min(percent, 1))))
+                    if size:
+                        self.q.put(("status", f"MEGA {percent * 100:.1f}% | {speed / 1024 / 1024:.2f} MB/s | ETA {seconds_to_text(eta)}"))
+                    else:
+                        self.q.put(("status", f"MEGA {downloaded / 1024 / 1024:.2f} MB | {speed / 1024 / 1024:.2f} MB/s"))
+
+        if size and output.exists() and output.stat().st_size != size:
+            raise RuntimeError(f"MEGA size mismatch: expected {size} bytes, got {output.stat().st_size} bytes")
+
+        if mp3_requested:
+            output = self.convert_to_mp3(download_output, final_mp3_output)
+
+        self.q.put(("log", f"{tr(self.lang, 'mega_saved')}: {output}"))
+
+    def download_direct(self, url, folder):
+        settings = self.speed_settings()
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "*/*",
+            "Connection": "keep-alive",
+        }
+
+        self.q.put(("status", tr(self.lang, "direct_running")))
+
+        final_url = url
+        total = 0
+        content_type = ""
+
+        try:
+            head = requests.head(url, allow_redirects=True, timeout=settings["timeout"], headers=headers)
+            final_url = head.url or url
+            total = int(head.headers.get("content-length", 0) or 0)
+            content_type = head.headers.get("content-type", "").lower()
+        except Exception as e:
+            self.q.put(("log", f"HEAD failed, using GET metadata fallback: {e}"))
+
+        name = filename_from_url(final_url)
+        if "." not in name:
+            if "mp4" in content_type:
+                name += ".mp4"
+            elif "webm" in content_type:
+                name += ".webm"
+            elif "matroska" in content_type or "mkv" in content_type:
+                name += ".mkv"
+            elif "audio" in content_type:
+                name += ".mp3"
+            else:
+                name += ".bin"
+
+        if self.clean_names_var.get():
+            name = safe_filename(Path(name).stem) + Path(name).suffix
+
+        mp3_requested = self.wants_mp3_output()
+        if mp3_requested:
+            self.ensure_ffmpeg_for_mp3()
+            self.q.put(("log", tr(self.lang, "mp3_output_enabled")))
+            raw_suffix = Path(name).suffix or ".bin"
+            output = unique_path(Path(folder) / (Path(name).stem + ".clipvault_tmp" + raw_suffix))
+            final_mp3_output = Path(folder) / (safe_filename(Path(name).stem, "download") + ".mp3")
+        else:
+            output = unique_path(Path(folder) / name)
+            final_mp3_output = None
+
+        threads = settings["direct_threads"]
+
+        if total > 10 * 1024 * 1024 and threads > 1 and server_supports_ranges(final_url, headers, settings["timeout"]):
+            self.q.put(("log", f"{tr(self.lang, 'turbo_active')}: {threads}"))
+            self.download_direct_multipart(final_url, output, total, headers, settings)
+            if mp3_requested:
+                output = self.convert_to_mp3(output, final_mp3_output)
+                self.q.put(("log", f"{tr(self.lang, 'saved')}: {output}"))
+            return
+
+        self.q.put(("log", tr(self.lang, "turbo_unavailable")))
+        with requests.get(
+            final_url,
+            stream=True,
+            timeout=settings["timeout"],
+            headers=headers,
+            allow_redirects=True,
+        ) as r:
+            r.raise_for_status()
+
+            if not total:
+                total = int(r.headers.get("content-length", 0) or 0)
+            if content_type == "":
+                content_type = r.headers.get("content-type", "").lower()
+
+            downloaded = 0
+            start_time = time.time()
+            self.q.put(("log", f"{tr(self.lang, 'saving_as')}: {output.name}"))
+
+            with open(output, "wb") as f:
+                for chunk in r.iter_content(chunk_size=settings["direct_chunk"]):
+                    if self.cancel_requested:
+                        try:
+                            f.close()
+                            output.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        raise CancelDownload(tr(self.lang, "cancelled"))
+
+                    if not chunk:
+                        continue
+
+                    f.write(chunk)
+                    downloaded += len(chunk)
+
+                    elapsed = max(time.time() - start_time, 0.1)
+                    speed = downloaded / elapsed
+                    percent = downloaded / total if total else 0
+                    eta = (total - downloaded) / speed if total and speed else None
+
+                    self.q.put(("progress", max(0, min(percent, 1))))
+                    if total:
+                        self.q.put(("status", f"{percent * 100:.1f}% | {speed / 1024 / 1024:.2f} MB/s | ETA {seconds_to_text(eta)}"))
+                    else:
+                        self.q.put(("status", f"{downloaded / 1024 / 1024:.2f} MB | {speed / 1024 / 1024:.2f} MB/s"))
+
+        if total and output.exists() and output.stat().st_size != total:
+            raise RuntimeError(f"Size mismatch: expected {total} bytes, got {output.stat().st_size} bytes")
+
+        if mp3_requested:
+            output = self.convert_to_mp3(output, final_mp3_output)
+
+        self.q.put(("log", f"{tr(self.lang, 'saved')}: {output}"))
+
+    def download_direct_multipart(self, url, output: Path, total: int, headers: dict, settings: dict):
+        temp_dir = Path(tempfile.mkdtemp(prefix="clipvault_parts_"))
+        threads_count = max(1, int(settings["direct_threads"]))
+        part_size = total // threads_count
+        downloaded_parts = [0 for _ in range(threads_count)]
+        errors = []
+        start_time = time.time()
+        cancel_event = threading.Event()
+
+        self.q.put(("log", f"{tr(self.lang, 'saving_as')}: {output.name}"))
+        self.q.put(("log", f"{tr(self.lang, 'filesize')}: {total / 1024 / 1024:.2f} MB"))
+
+        def worker(index: int, start_byte: int, end_byte: int):
+            part_path = temp_dir / f"part_{index}.tmp"
+            local_headers = dict(headers)
+            local_headers["Range"] = f"bytes={start_byte}-{end_byte}"
+            expected_len = end_byte - start_byte + 1
+
+            try:
+                with requests.get(
+                    url,
+                    stream=True,
+                    timeout=settings["timeout"],
+                    headers=local_headers,
+                    allow_redirects=True,
+                ) as r:
+                    if r.status_code != 206:
+                        raise RuntimeError(f"Part {index + 1}: server ignored Range request (HTTP {r.status_code})")
+
+                    with open(part_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=settings["direct_chunk"]):
+                            if self.cancel_requested or cancel_event.is_set():
+                                raise CancelDownload(tr(self.lang, "cancelled"))
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            downloaded_parts[index] += len(chunk)
+
+                if part_path.exists() and part_path.stat().st_size != expected_len:
+                    raise RuntimeError(f"Part {index + 1}: size mismatch")
+            except Exception as e:
+                cancel_event.set()
+                errors.append(e)
+
+        threads = []
+        for i in range(threads_count):
+            start_byte = i * part_size
+            end_byte = total - 1 if i == threads_count - 1 else ((i + 1) * part_size - 1)
+            t = threading.Thread(target=worker, args=(i, start_byte, end_byte), daemon=True)
+            threads.append(t)
+            t.start()
+
+        while any(t.is_alive() for t in threads):
+            if self.cancel_requested or cancel_event.is_set():
+                cancel_event.set()
+
+            downloaded = sum(downloaded_parts)
+            elapsed = max(time.time() - start_time, 0.1)
+            speed = downloaded / elapsed
+            percent = downloaded / total if total else 0
+            eta = (total - downloaded) / speed if total and speed else None
+
+            self.q.put(("progress", max(0, min(percent, 1))))
+            self.q.put(("status", f"Turbo {percent * 100:.1f}% | {speed / 1024 / 1024:.2f} MB/s | ETA {seconds_to_text(eta)}"))
+            time.sleep(0.4)
+
+        for t in threads:
+            t.join()
+
+        if self.cancel_requested:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            output.unlink(missing_ok=True)
+            raise CancelDownload(tr(self.lang, "cancelled"))
+
+        if errors:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise RuntimeError(f"Turbo download error: {errors[0]}")
+
+        self.q.put(("status", tr(self.lang, "combining_parts")))
+        with open(output, "wb") as out:
+            for i in range(threads_count):
+                part_path = temp_dir / f"part_{i}.tmp"
+                if not part_path.exists():
+                    raise RuntimeError(f"Missing part {i + 1}")
+                with open(part_path, "rb") as part:
+                    shutil.copyfileobj(part, out, length=1024 * 1024 * 8)
+
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+        if output.exists() and output.stat().st_size != total:
+            output.unlink(missing_ok=True)
+            raise RuntimeError(f"Final size mismatch: expected {total} bytes, got {output.stat().st_size} bytes")
+
+        self.q.put(("progress", 1))
+        self.q.put(("log", f"{tr(self.lang, 'saved')}: {output}"))
+
+    def download_ytdlp(self, url, folder):
+        if not self.ytdlp_path:
+            raise RuntimeError(tr(self.lang, "ytdlp_missing_long"))
+
+        settings = self.speed_settings()
+        quality_key = option_key("quality", self.quality_var.get(), self.lang)
+        out_ext = option_key("output", self.output_var.get(), self.lang)
+
+        self.q.put(("status", tr(self.lang, "yt_running")))
+
+        outtmpl = "%(title).180s [%(id)s].%(ext)s" if self.clean_names_var.get() else "%(id)s.%(ext)s"
+        out_path_template = os.path.join(folder, outtmpl)
+
+        cmd = [
+            self.ytdlp_path,
+            "-f", self.ytdlp_format(),
+            "-o", out_path_template,
+            "--newline",
+            "--no-warnings",
+            "--retries", "8",
+            "--fragment-retries", "8",
+            "--continue",
+            "--windows-filenames",
+            "--concurrent-fragments", str(settings["yt_fragments"]),
+            "--socket-timeout", "60",
+        ]
+
+        if not self.playlist_var.get():
+            cmd.append("--no-playlist")
+
+        if self.ffmpeg_path:
+            ffmpeg_location = str(Path(self.ffmpeg_path).parent)
+            cmd.extend(["--ffmpeg-location", ffmpeg_location])
+
+        if quality_key == "audio_mp3" or out_ext == "mp3":
+            self.ensure_ffmpeg_for_mp3()
+            self.q.put(("log", tr(self.lang, "mp3_output_enabled")))
+            cmd.extend(["-x", "--audio-format", "mp3", "--audio-quality", "192K"])
+        else:
+            cmd.extend(["--merge-output-format", out_ext])
+
+        cmd.append(url)
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+
+        last_log = time.time()
+
+        try:
+            for line in process.stdout:
+                if self.cancel_requested:
+                    try:
+                        process.terminate()
+                        process.wait(timeout=5)
+                    except Exception:
+                        try:
+                            process.kill()
+                        except Exception:
+                            pass
+                    raise CancelDownload(tr(self.lang, "cancelled"))
+
+                line = line.strip()
+                if not line:
+                    continue
+
+                if "[download]" in line:
+                    match = re.search(r"(\d+(?:\.\d+)?)%", line)
+                    if match:
+                        percent = float(match.group(1)) / 100.0
+                        self.q.put(("progress", max(0.0, min(percent, 1.0))))
+
+                    clean_line = re.sub(r"\s+", " ", line)
+                    self.q.put(("status", clean_line[:180]))
+
+                    now = time.time()
+                    if now - last_log > 5:
+                        last_log = now
+                        self.q.put(("log", clean_line[:300]))
+
+                elif "has already been downloaded" in line.lower():
+                    self.q.put(("log", line[:300]))
+
+                elif "error" in line.lower():
+                    self.q.put(("log", line[:500]))
+
+            return_code = process.wait()
+
+            if return_code != 0:
+                raise RuntimeError(f"{tr(self.lang, 'yt_error_exit')}: {return_code}")
+
+            self.q.put(("progress", 1))
+            self.q.put(("log", tr(self.lang, "yt_done")))
+
+        finally:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+            except Exception:
+                pass
+
+    # ========================================================
+    # Queue
+    # ========================================================
+    def process_queue(self):
+        try:
+            while True:
+                typ, payload = self.q.get_nowait()
+
+                if typ == "log":
+                    self.log(str(payload))
+                elif typ == "status":
+                    self.set_status(str(payload))
+                elif typ == "progress":
+                    self.progress.set(float(payload))
+                elif typ == "done":
+                    self.set_downloading_ui(False)
+                elif typ == "enable_check":
+                    self.check_button.configure(state="normal")
+                elif typ == "error":
+                    self.show_toast(tr(self.lang, "error"), str(payload), kind="error", duration=4200)
+                elif typ == "info":
+                    self.show_toast(tr(self.lang, "info"), str(payload), kind="info", duration=3200)
+
+                elif typ == "connection":
+                    self.internet_check_running = False
+                    self.update_connection_badge(bool(payload))
+                elif typ == "refresh_deps":
+                    self.refresh_dependency_paths()
+                elif typ == "requirements_done":
+                    self.requirements_install_running = False
+                    if hasattr(self, "btn_requirements"):
+                        self.btn_requirements.configure(state="normal", text="⬇  " + tr(self.lang, "requirements"))
+
+        except queue.Empty:
+            pass
+
+        self.after(200, self.process_queue)
+
+
+if __name__ == "__main__":
+    login = LoginWindow()
+    login.mainloop()
+
+    authenticated = getattr(login, "authenticated", False)
+    selected_language = getattr(login, "selected_language", "English")
+
+    if authenticated:
+        app = ClipVaultApp()
+        app.lang = selected_language
+        app.lang_var.set(app.lang)
+        app.change_app_language(app.lang)
+        app.mainloop()
